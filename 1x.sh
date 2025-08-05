@@ -658,6 +658,258 @@ add_ssh_user() {
 
     expiry_date=$(date -d "+$days days" +"%Y-%m-%d")
     useradd -m -s /bin/bash -e "$expiry_date" "$username"
+   echo "$username:$password" | chpasswd
+
+    echo -e "${GREEN}SSH User '$username' added. Expires: $expiry_date${NC}"
+
+    # Create OpenVPN client config
+    cd /etc/openvpn/easy-rsa
+    ./easyrsa build-client-full "$username" nopass >/dev/null 2>&1
+
+    cat /etc/openvpn/client-template.ovpn > "/root/${username}.ovpn"
+    echo "<ca>" >> "/root/${username}.ovpn"; cat /etc/openvpn/easy-rsa/pki/ca.crt >> "/root/${username}.ovpn"; echo "</ca>" >> "/root/${us>    echo "<cert>" >> "/root/${username}.ovpn"; cat /etc/openvpn/easy-rsa/pki/issued/${username}.crt >> "/root/${username}.ovpn"; echo "</c>    echo "<key>" >> "/root/${username}.ovpn"; cat /etc/openvpn/easy-rsa/pki/private/${username}.key >> "/root/${username}.ovpn"; echo "</k>
+    echo -e "${YELLOW}OpenVPN config for '$username' created at /root/${username}.ovpn${NC}"
+}
+
+delete_ssh_user() {
+    # This function remains largely the same
+    read -p "Enter username to delete: " username
+    if id "$username" &>/dev/null; then
+        userdel -r "$username"
+        cd /etc/openvpn/easy-rsa
+        ./easyrsa revoke "$username" >/dev/null 2>&1
+        ./easyrsa gen-crl >/dev/null 2>&1
+        cp /etc/openvpn/easy-rsa/pki/crl.pem /etc/openvpn/crl.pem
+        echo -e "${GREEN}User '$username' deleted.${NC}"
+    else
+        echo -e "${RED}User '$username' does not exist.${NC}"
+    fi
+}
+
+# --- System Functions ---
+check_services() {
+    echo "--- Service Status ---"
+    SERVICES=("sshd" "dropbear" "stunnel4" "xray" "squid" "badvpn@7100" "openvpn-server@server_tcp" "openvpn-server@server_udp")
+    for service in "${SERVICES[@]}"; do
+        if systemctl is-active --quiet "$service"; then
+            echo -e "$service: ${GREEN}Running${NC}"
+        else
+            echo -e "$service: ${RED}Stopped${NC}"
+        fi
+    done
+    echo "----------------------"
+}
+
+renew_ssl() {
+    echo "Stopping services on port 80/443 for renewal..."
+    systemctl stop ssh-ws-http.service; systemctl stop xray
+    echo "Renewing SSL Certificate..."
+    certbot renew --quiet
+    echo "Restarting services..."
+    systemctl start xray; systemctl start ssh-ws-http.service
+    echo "Done."
+}
+
+# --- Main Loop ---
+while true; do
+    show_menu
+    read -p "Enter your choice [1-9]: " choice
+    case $choice in
+        1) add_xray_user; press_enter_to_continue ;;
+        2) delete_xray_user; press_enter_to_continue ;;
+        3) list_xray_users; press_enter_to_continue ;;
+        4) add_ssh_user; press_enter_to_continue ;;
+        5) delete_ssh_user; press_enter_to_continue ;;
+        6) check_services; press_enter_to_continue ;;
+        7) renew_ssl; press_enter_to_continue ;;
+        8) reboot ;;
+        9) exit 0 ;;
+        *) echo -e "${RED}Invalid option. Please try again.${NC}"; sleep 1 ;;
+    esac
+done
+EOF
+
+    chmod +x /usr/local/bin/menu
+    info "Management menu created. Type 'menu' to use it."
+
+    # --- Create the VPN Monitor Script ---
+    info "Creating vpn-monitor script..."
+    cat > /usr/local/bin/vpn-monitor << 'EOF'
+#!/bin/bash
+# VPN User Monitor for Quota and Expiration
+
+USER_DB="/etc/regarstore/users.db"
+XRAY_API_ADDR="127.0.0.1:10085"
+XRAY_BIN="/usr/local/bin/xray"
+LOG_FILE="/var/log/vpn-monitor.log"
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
+}
+
+remove_user() {
+    local email="$1"
+    local protocol="$2"
+    local reason="$3"
+
+    local inbound_tag="${protocol}-in"
+
+    log "Removing user $email from $protocol due to $reason."
+
+    # Remove from XRAY service
+    $XRAY_BIN api inbound remove --server=$XRAY_API_ADDR --tag="$inbound_tag" --email="$email"
+
+    # Remove from local database
+    sed -i "/^$email;/d" "$USER_DB"
+}
+
+check_users() {
+    if [ ! -f "$USER_DB" ]; then
+        log "User database not found."
+        exit 1
+    fi
+
+    local current_date_s=$(date +%s)
+
+    while IFS=';' read -r email protocol creds quota_gb ip_limit exp_date; do
+        if [[ "$email" == \#* || -z "$email" ]]; then
+            continue
+        fi
+
+        # --- Check Expiration ---
+        local exp_date_s=$(date -d "$exp_date" +%s)
+        if [[ "$current_date_s" -gt "$exp_date_s" ]]; then
+            remove_user "$email" "$protocol" "expiration"
+            continue
+        fi
+
+        # --- Check Quota ---
+        if [[ "$quota_gb" -gt 0 ]]; then
+            # Query stats for user
+            uplink=$($XRAY_BIN api stats --server=$XRAY_API_ADDR --query "user>>>$email>>>traffic>>>uplink" --reset)
+            downlink=$($XRAY_BIN api stats --server=$XRAY_API_ADDR --query "user>>>$email>>>traffic>>>downlink" --reset)
+
+            # If stats exist, add to a running total
+            if [[ -n "$uplink" && "$downlink" ]]; then
+                # Store usage in a simple file per user
+                usage_file="/etc/regarstore/usage/${email}.usage"
+                mkdir -p /etc/regarstore/usage
+
+                total_usage_bytes=$(($(cat "$usage_file" 2>/dev/null || echo 0) + uplink + downlink))
+                echo "$total_usage_bytes" > "$usage_file"
+
+                quota_bytes=$((quota_gb * 1024 * 1024 * 1024))
+
+                if [[ "$total_usage_bytes" -gt "$quota_bytes" ]]; then
+                    remove_user "$email" "$protocol" "quota exceeded"
+                    rm -f "$usage_file" # Clean up usage file
+                fi
+            fi
+        fi
+    done < "$USER_DB"
+}
+
+log "VPN monitor script started."
+check_users
+log "VPN monitor script finished."
+EOF
+
+    chmod +x /usr/local/bin/vpn-monitor
+    info "VPN monitor script created at /usr/local/bin/vpn-monitor"
+}
+
+finalize_installation() {
+    info "Finalizing installation..."
+
+    # --- Add Branding ---
+    info "Adding Regar Store branding to login banner..."
+    echo "========================================" > /etc/motd
+    echo "" >> /etc/motd
+    echo "   Welcome to REGAR STORE VPN Server    " >> /etc/motd
+    echo "" >> /etc/motd
+    echo "   Type 'menu' to manage users/services " >> /etc/motd
+    echo "" >> /etc/motd
+    echo "========================================" >> /etc/motd
+
+    # --- Setup SSL Auto-Renewal ---
+    info "Setting up automatic SSL renewal..."
+    (crontab -l 2>/dev/null; echo "0 5 * * * /usr/bin/certbot renew --quiet --pre-hook 'systemctl stop xray' --post-hook 'systemctl start >
+
+    # --- Setup User Monitor Cron Job ---
+    info "Setting up user monitor cron job (every 5 minutes)..."
+    (crontab -l 2>/dev/null; echo "*/5 * * * * /usr/local/bin/vpn-monitor >> /var/log/vpn-monitor.log 2>&1") | crontab -
+
+    # --- Display Credentials ---
+    clear
+    info "Installation complete! Please save the following information:"
+    IP_ADDRESS=$(curl -s ifconfig.me)
+    DOMAIN=$(cat /root/domain.txt)
+    source /root/xray_credentials.txt
+
+    echo -e "\n${YELLOW}--- Server Information ---${NC}"
+    echo -e "IP Address: ${GREEN}$IP_ADDRESS${NC}"
+    echo -e "Domain:     ${GREEN}$DOMAIN${NC}"
+
+    echo -e "\n${YELLOW}--- SSH / Dropbear / Stunnel --- ${NC}"
+    echo -e "Use any username/password created via the 'menu' command."
+    echo -e "SSH Port:                 ${GREEN}22${NC}"
+    echo -e "Dropbear Ports:           ${GREEN}109, 143${NC}"
+    echo -e "Stunnel (SSL->SSH):       ${GREEN}777${NC}"
+    echo -e "Stunnel (SSL->Dropbear):  ${GREEN}445${NC}"
+
+    echo -e "\n${YELLOW}--- SSH over WebSocket --- ${NC}"
+    echo -e "HTTP Port:                ${GREEN}80, 8080${NC}"
+
+    echo -e "\n${YELLOW}--- OpenVPN --- ${NC}"
+    echo -e "TCP Port:                 ${GREEN}1194${NC}"
+    echo -e "UDP Port:                 ${GREEN}2200${NC}"
+    echo -e "Stunnel (SSL->OpenVPN):   ${GREEN}8443${NC}"
+    echo -e "Config files generated via 'menu' are in /root/"
+
+    echo -e "\n${YELLOW}--- XRAY (VLESS/VMess/Trojan) --- ${NC}"
+    echo -e "TLS Port:                 ${GREEN}443${NC}"
+    echo -e "Non-TLS Port (VMess):     ${GREEN}80${NC}"
+    echo -e "--- VLESS over WS (TLS) ---"
+    echo -e "UUID:     ${GREEN}$VLESS_UUID${NC}"
+    echo -e "Path:     ${GREEN}/vless${NC}"
+    echo -e "--- VMess over WS (TLS) ---"
+    echo -e "UUID:     ${GREEN}$VMESS_UUID${NC}"
+    echo -e "Path:     ${GREEN}/vmess${NC}"
+    echo -e "--- Trojan over WS (TLS) ---"
+        echo -e "Password: ${GREEN}$TROJAN_PASSWORD${NC}"
+    echo -e "Path:     ${GREEN}/trojan${NC}"
+    echo -e "--- VMess over WS (HTTP) ---"
+    echo -e "UUID:     ${GREEN}$VMESS_UUID${NC}"
+    echo -e "Path:     ${GREEN}/vmess-http${NC}"
+
+    echo -e "\n${YELLOW}--- Squid Proxy --- ${NC}"
+    echo -e "Ports:                    ${GREEN}3128, 8080${NC}"
+}
+
+
+# --- Main Execution Logic ---
+main() {
+    check_root
+    check_os
+
+    warn "Pastikan domain Anda sudah di-pointing ke IP Address VPS ini."
+    ask_domain
+
+    install_dependencies
+    setup_management_menu
+    setup_ssh_tunneling
+    setup_openvpn
+    setup_xray
+    setup_support_services
+    setup_security
+
+    finalize_installation
+
+    info "Instalasi Selesai! Server akan di-reboot."
+    # reboot
+}
+# --- Run the script ---
+main
 
 
 
