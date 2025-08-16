@@ -757,3 +757,4 @@ main() {
 
 # --- Run the script ---
 main
+EOF
