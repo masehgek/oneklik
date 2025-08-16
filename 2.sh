@@ -137,7 +137,7 @@ EOF
 Description=SSH Over WebSocket HTTP
 After=network.target nss-lookup.target
 [Service]
-User =root
+User   =root
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
@@ -151,7 +151,7 @@ EOF
 Description=SSH Over WebSocket ALT
 After=network.target nss-lookup.target
 [Service]
-User =root
+User   =root
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
@@ -260,8 +260,8 @@ setup_xray() {
   "policy": {
     "levels": {
       "0": {
-        "statsUser Uplink": true,
-        "statsUser Downlink": true
+        "statsUser   Uplink": true,
+        "statsUser   Downlink": true
       }
     },
     "system": {
@@ -404,18 +404,7 @@ After=network.target
 
 [Service]
 ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr 127.0.0.1:%i --max-clients 512
-Restart=always
-User =nobody
-Group=nogroup
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-    systemctl enable badvpn@7100 >/dev/null 2>&1
-    systemctl start badvpn@7100
-    systemctl enable badvpn@7200 >/dev/null 2>&1
+Restart=always    systemctl enable badvpn@7200 >/dev/null 2>&1
     systemctl start badvpn@7200
     systemctl enable badvpn@7300 >/dev/null 2>&1
     systemctl start badvpn@7300
@@ -526,7 +515,6 @@ show_menu() {
     echo " 9. Exit"
     echo "----------------------------------------"
 }
-EOF
 
 # --- XRAY User Management ---
 add_xray_user() {
@@ -541,7 +529,7 @@ add_xray_user() {
 
     local protocol_name inbound_tag creds_id creds_pass settings
 
-        case $proto_choice in
+    case $proto_choice in
         1) protocol_name="vless"; inbound_tag="vless-in"; creds_id=$(xray uuid) ;;
         2) protocol_name="vmess"; inbound_tag="vmess-in"; creds_id=$(xray uuid) ;;
         3) protocol_name="trojan"; inbound_tag="trojan-in"; creds_pass=$(openssl rand -base64 12) ;;
@@ -562,7 +550,7 @@ add_xray_user() {
 
     if [[ $? -eq 0 ]]; then
         echo "$email;$protocol_name;$creds_for_db;$quota_gb;$ip_limit;$exp_date" >> "$USER_DB"
-        echo -e "${GREEN}User  '$email' for $protocol_name added successfully.${NC}"
+        echo -e "${GREEN}User    '$email' for $protocol_name added successfully.${NC}"
         echo "UUID/Password: $creds_for_db"
     else
         echo -e "${RED}Failed to add user to XRAY service. Error: $result${NC}"
@@ -574,7 +562,7 @@ delete_xray_user() {
 
     user_line=$(grep "^$email;" "$USER_DB")
     if [[ -z "$user_line" ]]; then
-        echo -e "${RED}User  '$email' not found in database.${NC}"
+        echo -e "${RED}User    '$email' not found in database.${NC}"
         return
     fi
 
@@ -586,7 +574,7 @@ delete_xray_user() {
 
     if [[ $? -eq 0 ]]; then
         sed -i "/^$email;/d" "$USER_DB"
-        echo -e "${GREEN}User  '$email' removed from $protocol_name.${NC}"
+        echo -e "${GREEN}User    '$email' removed from $protocol_name.${NC}"
     else
         echo -e "${RED}Failed to remove user from XRAY service. Error: $result${NC}"
     fi
@@ -634,9 +622,9 @@ delete_ssh_user() {
         ./easyrsa revoke "$username" >/dev/null 2>&1
         ./easyrsa gen-crl >/dev/null 2>&1
         cp /etc/openvpn/easy-rsa/pki/crl.pem /etc/openvpn/crl.pem
-        echo -e "${GREEN}User  '$username' deleted.${NC}"
+        echo -e "${GREEN}User    '$username' deleted.${NC}"
     else
-        echo -e "${RED}User  '$username' does not exist.${NC}"
+        echo -e "${RED}User    '$username' does not exist.${NC}"
     fi
 }
 
@@ -752,9 +740,21 @@ main() {
     finalize_installation
 
     info "Instalasi Selesai! Server akan di-reboot."
+    # Uncomment the next line to enable automatic reboot after installation
     # reboot
 }
 
 # --- Run the script ---
 main
+User  =nobody
+Group=nogroup
+
+[Install]
+WantedBy=multi-user.target
 EOF
+
+    systemctl daemon-reload
+    systemctl enable badvpn@7100 >/dev/null 2>&1
+    systemctl start badvpn@7100
+    systemctl enable badvpn@720
+    
