@@ -40,13 +40,13 @@ check_root() {
 
 check_os() {
     source /etc/os-release
-    if [[ "${ID}" != "ubuntu" || ( "${VERSION_ID}" != "20.04" && "${VERSION_ID}" != "22.04" ) ]]; then
-        error "This script is designed for Ubuntu 20.04 or 22.04 only."
+    if [[ "${ID}" != "ubuntu" || "${VERSION_ID}" != "22.04" ]]; then
+        error "This script requires Ubuntu 22.04. Your version is ${VERSION_ID}."
     fi
     info "Operating system check passed."
 }
 
-# --- Feature Installation Functions ---
+# --- Feature Installation Functions (to be implemented) ---
 install_dependencies() {
     info "Updating package lists..."
     apt-get update >/dev/null 2>&1
@@ -59,8 +59,9 @@ install_dependencies() {
         ufw fail2ban \
         unzip zip \
         python3 python3-pip \
-        dropbear stunnel4 squid haveged
+        dropbear stunnel4 squid haveged certbot acl
 
+    # Install websocket proxy
     info "Installing Python WebSocket proxy..."
     pip3 install proxy.py >/dev/null 2>&1
     info "Base dependencies installed."
@@ -73,6 +74,8 @@ ask_domain() {
         error "Domain tidak boleh kosong."
     fi
     info "Domain Anda akan diatur ke: $DOMAIN"
+
+    # Store domain for later use by other scripts
     echo "$DOMAIN" > /root/domain.txt
 }
 
@@ -137,7 +140,7 @@ EOF
 Description=SSH Over WebSocket HTTP
 After=network.target nss-lookup.target
 [Service]
-User   =root
+User =root
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
@@ -151,7 +154,7 @@ EOF
 Description=SSH Over WebSocket ALT
 After=network.target nss-lookup.target
 [Service]
-User   =root
+User =root
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
@@ -179,72 +182,95 @@ EOF
 }
 
 setup_openvpn() {
-    info "Setting up OpenVPN server using a robust, industry-standard installer..."
+    info "Setting up OpenVPN server using an interactive, standard installer..."
 
-    curl -o /root/openvpn-install.sh https://raw.githubusercontent.com/Nyr/openvpn-install/master/openvpn-install.sh
-    chmod +x /root/openvpn-install.sh
+    # Download the well-tested openvpn-install.sh script if it doesn't exist.
+    if [ ! -f /root/openvpn-install.sh ]; then
+        info "Downloading standard OpenVPN installer..."
+        curl -o /root/openvpn-install.sh https://raw.githubusercontent.com/Nyr/openvpn-install/master/openvpn-install.sh
+        chmod +x /root/openvpn-install.sh
+    fi
 
-    info "Running the OpenVPN installer. If it fails, the error will be shown below."
-    warn "This installer will create one OpenVPN instance (UDP on Port 2200)."
+    # --- Run the installer INTERACTIVELY ---
+    info "The standard OpenVPN installer will now run."
+    warn "Please answer the questions it asks. If you see any errors, please note them."
+    warn "It is recommended to use UDP on port 2200 for the first run."
 
-    AUTO_INSTALL=y \
-    APPROVE_INSTALL=y \
-    APPROVE_IP=y \
-    PORT_CHOICE=2 \
-    PORT=2200 \
-    PROTOCOL_CHOICE=1 \
-    DNS=1 \
-    CLIENT=initial-client \
-    PASS=1 \
+    # Run the script interactively, allowing the user to see everything.
     /root/openvpn-install.sh
 
+    # --- Ask for user confirmation ---
+    echo ""
+    read -p "Did the OpenVPN installation above complete WITHOUT any fatal errors? [y/n]: " -n 1 -r
+    echo ""
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        error "OpenVPN setup aborted by user. Please re-run the main script when ready."
+    fi
+
+    # --- Verification ---
     info "Verifying OpenVPN installation..."
     if [ ! -f /etc/openvpn/server/server.conf ]; then
-        error "OpenVPN installation FAILED. The installer script did not create /etc/openvpn/server/server.conf. Please review the output."
+        error "OpenVPN installation verification FAILED. The file /etc/openvpn/server/server.conf was not found. The installation likely failed."
     fi
     if ! systemctl is-active --quiet openvpn-server@server.service; then
         error "OpenVPN service 'openvpn-server@server.service' is not running. Please check the logs."
     fi
 
-    info "Adapting management menu for OpenVPN..."
-    sed -i '/add_ssh_user/d' /usr/local/bin/menu
-    sed -i '/delete_ssh_user/d' /usr/local/bin/menu
-    sed -i '/Add SSH\/OpenVPN User/d' /usr/local/bin/menu
-    sed -i '/Delete SSH\/OpenVPN User/d' /usr/local/bin/menu
-    sed -i '/List XRAY Users/ a \ 4. Manage OpenVPN Users (run installer)' /usr/local/bin/menu
-    sed -i '/list_xray_users/ a \        4) /root/openvpn-install.sh; press_enter_to_continue ;;' /usr/local/bin/menu
-
     info "OpenVPN setup completed successfully."
-    info "To add/remove OpenVPN users, run 'menu' and select the OpenVPN option, or run '/root/openvpn-install.sh' directly."
+    info "To add/remove more OpenVPN users, run '/root/openvpn-install.sh' again."
 }
 
 setup_xray() {
     info "Setting up XRAY (Vmess/Vless/Trojan)..."
     DOMAIN=$(cat /root/domain.txt)
 
+    # --- Install XRAY Core ---
     info "Installing XRAY core..."
     bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install --without-geodata >/dev/null 2>&1
 
+    # --- DNS Pre-flight Check ---
+    info "Performing DNS pre-flight check for $DOMAIN..."
+    if ! command -v dig &> /dev/null; then
+        apt-get install -y dnsutils >/dev/null 2>&1
+    fi
+
+    local_ip=$(curl -s ifconfig.me)
+    resolved_ip=$(dig +short "$DOMAIN" @8.8.8.8)
+
+    if [[ "$local_ip" != "$resolved_ip" ]]; then
+        error "DNS validation failed. Domain '$DOMAIN' points to '$resolved_ip', but this VPS IP is '$local_ip'. Please wait for DNS propagation or check your DNS records."
+    fi
+    info "DNS check passed. Domain points to this VPS."
+
+    # --- Obtain SSL Certificate using Certbot ---
     info "Obtaining SSL certificate for $DOMAIN..."
+    # Stop services on port 80 to allow certbot to bind
     systemctl stop ssh-ws-http.service
+    # Temporarily allow port 80 through firewall for challenge
     ufw allow 80/tcp
+
     if ! certbot certonly --standalone -d "$DOMAIN" --non-interactive --agree-tos -m "admin@$DOMAIN" --preferred-challenges http; then
         error "Gagal mendapatkan sertifikat SSL dari Let's Encrypt. Pastikan domain Anda sudah di-pointing ke IP VPS ini."
     fi
 
+    # Close port 80 again and restart service
     ufw deny 80/tcp
     systemctl start ssh-ws-http.service
     info "SSL certificate obtained successfully."
 
+    # --- Create XRAY Config ---
     info "Creating XRAY configuration..."
+    # Generate necessary UUIDs and password
     VLESS_UUID=$(xray uuid)
     VMESS_UUID=$(xray uuid)
     TROJAN_PASSWORD=$(openssl rand -base64 16)
 
+    # Save credentials for later display
     echo "VLESS_UUID=${VLESS_UUID}" > /root/xray_credentials.txt
-    echo "VMESS_UUID=${VMESS_UUID}" >> /root/xray_credentials.txt
+        echo "VMESS_UUID=${VMESS_UUID}" >> /root/xray_credentials.txt
     echo "TROJAN_PASSWORD=${TROJAN_PASSWORD}" >> /root/xray_credentials.txt
 
+    # Create the config file with API and Stats enabled
     cat > /usr/local/etc/xray/config.json << EOF
 {
   "log": { "loglevel": "warning" },
@@ -260,8 +286,8 @@ setup_xray() {
   "policy": {
     "levels": {
       "0": {
-        "statsUser   Uplink": true,
-        "statsUser   Downlink": true
+        "statsUser Uplink": true,
+        "statsUser Downlink": true
       }
     },
     "system": {
@@ -287,7 +313,7 @@ setup_xray() {
         "fallbacks": [
           { "path": "/vmess", "dest": 8082, "xver": 1 },
           { "path": "/trojan", "dest": 8083, "xver": 1 }
-       ]
+        ]
       },
       "streamSettings": {
         "network": "ws",
@@ -317,7 +343,8 @@ setup_xray() {
     {
       "port": 80, "protocol": "vmess", "tag": "vmess-http-in",
       "settings": { "clients": [ { "id": "${VMESS_UUID}", "alterId": 0, "email": "user@${DOMAIN}" } ] },
-      "streamSettings": { "network": "ws", "security": "none", "wsSettings": { "path": "/vmess-http" } }
+      "streamSettings": { "network": "ws", "security": "none", "wsSettings": { "path": "/vmess-http" } },
+      "sniffing": { "enabled": true, "destOverride": ["http", "tls"] }
     }
   ],
   "outbounds": [
@@ -336,20 +363,21 @@ setup_xray() {
 }
 EOF
 
-    info "Restarting XRAY service..."
-    systemctl enable xray >/dev/null 2>&1
-    systemctl restart xray
+    # --- Final Permissions Fix ---
+    info "Applying final permissions fix for XRAY..."
+    chmod 644 /usr/local/etc/xray/config.json
+    setfacl -R -m u:nobody:r-x /etc/letsencrypt/live/
+    setfacl -R -m u:nobody:r-x /etc/letsencrypt/archive/
 
-    info "Updating Stunnel to free up port 443 for XRAY..."
-    sed -i '/\$openvpn_ssl\$/,+2d' /etc/stunnel/stunnel.conf
-    cat >> /etc/stunnel/stunnel.conf << EOF
+    systemctl daemon-reload
 
-[openvpn_ssl_alt]
-accept = 8443
-connect = 127.0.0.1:1194
-EOF
-    sed -i "s|cert = /etc/stunnel/stunnel.pem|cert = /etc/letsencrypt/live/${DOMAIN}/fullchain.pem\nkey = /etc/letsencrypt/live/${DOMAIN}/privkey.pem|" /etc/stunnel/stunnel.conf
-    systemctl restart stunnel4
+    # --- Restart XRAY ---
+    info "Restarting XRAY service with correct permissions..."
+    if systemctl restart xray; then
+        info "XRAY service restarted successfully."
+    else
+        error "XRAY service failed to start. Please check 'journalctl -u xray'."
+    fi
 
     info "XRAY setup completed."
 }
@@ -357,12 +385,17 @@ EOF
 setup_support_services() {
     info "Setting up Squid Proxy and Badvpn..."
 
+    # --- Configure Squid Proxy ---
     info "Configuring Squid Proxy on ports 3128 & 8080..."
     if [ -f /etc/squid/squid.conf ]; then
+        # Allow all connections by replacing "http_access deny all"
         sed -i 's/http_access deny all/http_access allow all/' /etc/squid/squid.conf
+        # Ensure default http_access allow localhost is not the only allow rule
         sed -i 's/http_access allow localhost/#http_access allow localhost/' /etc/squid/squid.conf
+        # Add additional ports if they don't exist
         grep -q -F "http_port 8080" /etc/squid/squid.conf || echo "http_port 8080" >> /etc/squid/squid.conf
         grep -q -F "http_port 3128" /etc/squid/squid.conf || echo "http_port 3128" >> /etc/squid/squid.conf
+        # Set visible hostname
         DOMAIN=$(cat /root/domain.txt)
         sed -i "s/# visible_hostname .*/visible_hostname $DOMAIN/" /etc/squid/squid.conf
 
@@ -372,6 +405,7 @@ setup_support_services() {
         warn "Squid configuration file not found. Skipping."
     fi
 
+    # --- Compile and Install Badvpn UDP Gateway ---
     info "Compiling and installing Badvpn UDP Gateway..."
     if ! command -v git &> /dev/null; then
         info "Installing git..."
@@ -396,6 +430,7 @@ setup_support_services() {
     cd /root
     rm -rf /root/badvpn
 
+    # --- Create Badvpn Systemd Service Template ---
     info "Creating Badvpn service for ports 7100, 7200, 7300..."
     cat > /etc/systemd/system/badvpn@.service << EOF
 [Unit]
@@ -404,7 +439,19 @@ After=network.target
 
 [Service]
 ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr 127.0.0.1:%i --max-clients 512
-Restart=always    systemctl enable badvpn@7200 >/dev/null 2>&1
+Restart=always
+User =nobody
+Group=nogroup
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    # Enable and start services for specified ports
+    systemctl enable badvpn@7100 >/dev/null 2>&1
+    systemctl start badvpn@7100
+    systemctl enable badvpn@7200 >/dev/null 2>&1
     systemctl start badvpn@7200
     systemctl enable badvpn@7300 >/dev/null 2>&1
     systemctl start badvpn@7300
@@ -415,7 +462,9 @@ Restart=always    systemctl enable badvpn@7200 >/dev/null 2>&1
 setup_security() {
     info "Setting up Firewall, Fail2Ban, and BBR..."
 
+    # --- Configure Firewall (UFW) ---
     info "Configuring UFW to open all necessary ports..."
+    # Deny all incoming by default and allow outgoing
     ufw default deny incoming >/dev/null 2>&1
     ufw default allow outgoing >/dev/null 2>&1
 
@@ -491,6 +540,7 @@ NC='\033[0m'
 USER_DB="/etc/regarstore/users.db"
 XRAY_API_ADDR="127.0.0.1:10085"
 XRAY_BIN="/usr/local/bin/xray"
+OPENVPN_INSTALLER="/root/openvpn-install.sh"
 
 # --- Helper Functions ---
 function press_enter_to_continue() {
@@ -507,19 +557,20 @@ show_menu() {
     echo " 1. Add XRAY User (VLESS/VMess/Trojan)"
     echo " 2. Delete XRAY User"
     echo " 3. List XRAY Users"
-    echo " 4. Add SSH/OpenVPN User"
-    echo " 5. Delete SSH/OpenVPN User"
-    echo " 6. Check Service Status"
-    echo " 7. Renew SSL Certificate"
-    echo " 8. Reboot Server"
-    echo " 9. Exit"
+    echo " 4. Show XRAY Share Links"
+    echo " 5. Manage OpenVPN Users (run installer)"
+    echo " 6. Manage SSH Users"
+    echo " 7. Check Service Status"
+    echo " 8. Renew SSL Certificate"
+    echo " 9. Reboot Server"
+    echo " 10. Exit"
     echo "----------------------------------------"
 }
 
-# --- XRAY User Management ---
+# --- XRAY User Management (jq method) ---
 add_xray_user() {
     echo "--- Add XRAY User ---"
-    read -p "Enter username (email format, e.g., user@regar.store): " email
+    read -p "Enter username (email format): " email
     read -p "Select Protocol [1=VLESS, 2=VMess, 3=Trojan]: " proto_choice
     read -p "Enter Quota (GB, 0 for unlimited): " quota_gb
     read -p "Enter IP Limit (0 for unlimited): " ip_limit
@@ -527,62 +578,58 @@ add_xray_user() {
 
     exp_date=$(date -d "+$days days" +"%Y-%m-%d")
 
-    local protocol_name inbound_tag creds_id creds_pass settings
+    local protocol_name inbound_tag new_client creds_for_db
 
     case $proto_choice in
-        1) protocol_name="vless"; inbound_tag="vless-in"; creds_id=$(xray uuid) ;;
-        2) protocol_name="vmess"; inbound_tag="vmess-in"; creds_id=$(xray uuid) ;;
-        3) protocol_name="trojan"; inbound_tag="trojan-in"; creds_pass=$(openssl rand -base64 12) ;;
+        1) protocol_name="vless"; inbound_tag="vless-in"; creds_for_db=$($XRAY_BIN uuid); new_client=$(jq -n --arg id "$creds_for_db" --arg email "$email" '{id: $id, email: $email, level: 0}') ;;
+        2) protocol_name="vmess"; inbound_tag="vmess-in"; creds_for_db=$($XRAY_BIN uuid); new_client=$(jq -n --arg id "$creds_for_db" --arg email "$email" '{id: $id, email: $email, level: 0}') ;;
+        3) protocol_name="trojan"; inbound_tag="trojan-in"; creds_for_db=$(openssl rand -base64 12); new_client=$(jq -n --arg pass "$creds_for_db" --arg email "$email" '{password: $pass, email: $email, level: 0}') ;;
         *) echo -e "${RED}Invalid protocol choice.${NC}"; return ;;
     esac
 
-    # Construct settings JSON for API call
-    if [[ -n "$creds_pass" ]]; then # Trojan
-        settings="{\"clients\": [{\"password\": \"$creds_pass\", \"email\": \"$email\", \"level\": 0}]}"
-        creds_for_db=$creds_pass
-    else # VLESS/VMess
-        settings="{\"clients\": [{\"id\": \"$creds_id\", \"email\": \"$email\", \"level\": 0}]}"
-        creds_for_db=$creds_id
-    fi
+    # Modify the config file
+    config_file="/usr/local/etc/xray/config.json"
+    temp_config=$(mktemp)
 
-    # Add user to XRAY service via API
-    result=$($XRAY_BIN api inbound add --server=$XRAY_API_ADDR --tag=$inbound_tag --protocol=$protocol_name --settings="$settings")
+    jq "(.inbounds[] | select(.tag == \"$inbound_tag\").settings.clients) += [$new_client]" "$config_file" > "$temp_config" && mv "$temp_config" "$config_file"
 
     if [[ $? -eq 0 ]]; then
         echo "$email;$protocol_name;$creds_for_db;$quota_gb;$ip_limit;$exp_date" >> "$USER_DB"
-        echo -e "${GREEN}User    '$email' for $protocol_name added successfully.${NC}"
+        echo -e "${GREEN}User  '$email' for $protocol_name added. Restarting XRAY...${NC}"
+        systemctl restart xray
         echo "UUID/Password: $creds_for_db"
     else
-        echo -e "${RED}Failed to add user to XRAY service. Error: $result${NC}"
+        echo -e "${RED}Failed to modify xray config file.${NC}"
     fi
 }
 
 delete_xray_user() {
     read -p "Enter username (email) to delete: " email
-
     user_line=$(grep "^$email;" "$USER_DB")
     if [[ -z "$user_line" ]]; then
-        echo -e "${RED}User    '$email' not found in database.${NC}"
-        return
+        echo -e "${RED}User  '$email' not found in database.${NC}"; return
     fi
 
     protocol_name=$(echo "$user_line" | cut -d';' -f2)
     inbound_tag="${protocol_name}-in"
+    config_file="/usr/local/etc/xray/config.json"
+    temp_config=$(mktemp)
 
-    # Remove user from XRAY service via API
-    result=$($XRAY_BIN api inbound remove --server=$XRAY_API_ADDR --tag="$inbound_tag" --email="$email")
+    # Modify the config file
+    jq "del(.inbounds[] | select(.tag == \"$inbound_tag\").settings.clients[] | select(.email == \"$email\"))" "$config_file" > "$temp_config" && mv "$temp_config" "$config_file"
 
     if [[ $? -eq 0 ]]; then
         sed -i "/^$email;/d" "$USER_DB"
-        echo -e "${GREEN}User    '$email' removed from $protocol_name.${NC}"
+        echo -e "${GREEN}User  '$email' removed. Restarting XRAY...${NC}"
+        systemctl restart xray
     else
-        echo -e "${RED}Failed to remove user from XRAY service. Error: $result${NC}"
+        echo -e "${RED}Failed to modify xray config file.${NC}"
     fi
 }
 
 list_xray_users() {
     echo "--- XRAY User List ---"
-    printf "%-25s | %-8s | %-10s | %-10s | %-12s\n" "Email" "Protocol" "Quota (GB)" "IP Limit" "Expires"
+    printf "%-25s | %-8s | %-10s | %-10s | %-12s\n" "Email" "Protocol" "Quota(GB)" "IP Limit" "Expires"
     echo "-----------------------------------------------------------------------------"
     while IFS=';' read -r email protocol creds quota_gb ip_limit exp_date; do
         [[ "$email" == \#* ]] && continue
@@ -591,47 +638,61 @@ list_xray_users() {
     echo "-----------------------------------------------------------------------------"
 }
 
-# --- SSH/OpenVPN User Management (Legacy) ---
-add_ssh_user() {
-    read -p "Enter username: " username
-    read -p "Enter password: " password
-    read -p "Enter expiration days (e.g., 30): " days
+show_xray_share_links() {
+    DOMAIN=$(cat /root/domain.txt)
+    echo "--- XRAY Shareable Links ---"
+    while IFS=';' read -r email protocol creds quota_gb ip_limit exp_date; do
+        if [[ "$email" == \#* || -z "$email" ]]; then continue; fi
 
-    expiry_date=$(date -d "+$days days" +"%Y-%m-%d")
-    useradd -m -s /bin/bash -e "$expiry_date" "$username"
-    echo "$username:$password" | chpasswd
-
-    echo -e "${GREEN}SSH User '$username' added. Expires: $expiry_date${NC}"
-
-    # Create OpenVPN client config
-    cd /etc/openvpn/easy-rsa
-    ./easyrsa build-client-full "$username" nopass >/dev/null 2>&1
-
-    cat /etc/openvpn/client-template.ovpn > "/root/${username}.ovpn"
-    echo "<ca>" >> "/root/${username}.ovpn"; cat /etc/openvpn/easy-rsa/pki/ca.crt >> "/root/${username}.ovpn"; echo "</ca>" >> "/root/${username}.ovpn"
-    echo "<cert>" >> "/root/${username}.ovpn"; cat /etc/openvpn/easy-rsa/pki/issued/${username}.crt >> "/root/${username}.ovpn"; echo "</cert>" >> "/root/${username}.ovpn"
-    echo "<key>" >> "/root/${username}.ovpn"; cat /etc/openvpn/easy-rsa/pki/private/${username}.key >> "/root/${username}.ovpn"; echo "</key>" >> "/root/${username}.ovpn"
-    echo -e "${YELLOW}OpenVPN config for '$username' created at /root/${username}.ovpn${NC}"
+        echo -e "\n${YELLOW}:User  ${email}${NC}"
+        case $protocol in
+            vless)
+                link="vless://${creds}@${DOMAIN}:443?type=ws&path=%2Fvless&security=tls#${email}"
+                echo -e "${GREEN}$link${NC}"
+                ;;
+            vmess)
+                json="{\"v\":\"2\",\"ps\":\"${email}\",\"add\":\"${DOMAIN}\",\"port\":\"443\",\"id\":\"${creds}\",\"aid\":0,\"net\":\"ws\",\"type\":\"none\",\"host\":\"${DOMAIN}\",\"path\":\"/vmess\",\"tls\":\"tls\"}"
+                link="vmess://$(echo -n $json | base64 -w 0)"
+                echo -e "${GREEN}$link${NC}"
+                ;;
+            trojan)
+                link="trojan://${creds}@${DOMAIN}:443?type=ws&path=%2Ftrojan&security=tls#${email}"
+                                echo -e "${GREEN}$link${NC}"
+                ;;
+        esac
+    done < "$USER_DB"
+    echo "----------------------------"
 }
 
-delete_ssh_user() {
-    read -p "Enter username to delete: " username
-    if id "$username" &>/dev/null; then
-        userdel -r "$username"
-        cd /etc/openvpn/easy-rsa
-        ./easyrsa revoke "$username" >/dev/null 2>&1
-        ./easyrsa gen-crl >/dev/null 2>&1
-        cp /etc/openvpn/easy-rsa/pki/crl.pem /etc/openvpn/crl.pem
-        echo -e "${GREEN}User    '$username' deleted.${NC}"
-    else
-        echo -e "${RED}User    '$username' does not exist.${NC}"
-    fi
+# --- Other User Management ---
+manage_ssh_users() {
+    echo "Simple SSH User Management"
+    read -p "Action [1=Add, 2=Delete]: " action
+    case $action in
+        1) read -p "Enter username: " username
+           read -p "Enter password: " password
+           read -p "Enter expiration days (e.g., 30): " days
+           expiry_date=$(date -d "+$days days" +"%Y-%m-%d")
+           useradd -m -s /bin/bash -e "$expiry_date" "$username"
+           echo "$username:$password" | chpasswd
+           echo -e "${GREEN}SSH User '$username' added. Expires: $expiry_date${NC}"
+           ;;
+        2) read -p "Enter username to delete: " username
+           if id "$username" &>/dev/null; then
+               userdel -r "$username"
+               echo -e "${GREEN}User  '$username' deleted.${NC}"
+           else
+               echo -e "${RED}User  '$username' does not exist.${NC}"
+           fi
+           ;;
+        *) echo "Invalid action." ;;
+    esac
 }
 
 # --- System Functions ---
 check_services() {
     echo "--- Service Status ---"
-    SERVICES=("sshd" "dropbear" "stunnel4" "xray" "squid" "badvpn@7100" "openvpn-server@server_tcp" "openvpn-server@server_udp")
+    SERVICES=("sshd" "dropbear" "stunnel4" "xray" "squid" "badvpn@7100" "openvpn-server@server")
     for service in "${SERVICES[@]}"; do
         if systemctl is-active --quiet "$service"; then
             echo -e "$service: ${GREEN}Running${NC}"
@@ -652,19 +713,164 @@ renew_ssl() {
     echo "Done."
 }
 
-# --- Finalize Installation ---
+# --- Main Loop ---
+while true; do
+    show_menu
+    read -p "Enter your choice [1-10]: " choice
+    case $choice in
+        1) add_xray_user; press_enter_to_continue ;;
+        2) delete_xray_user; press_enter_to_continue ;;
+        3) list_xray_users; press_enter_to_continue ;;
+        4) show_xray_share_links; press_enter_to_continue ;;
+        5) $OPENVPN_INSTALLER; press_enter_to_continue ;;
+        6) manage_ssh_users; press_enter_to_continue ;;
+        7) check_services; press_enter_to_continue ;;
+        8) renew_ssl; press_enter_to_continue ;;
+        9) reboot ;;
+        10) exit 0 ;;
+        *) echo -e "${RED}Invalid option. Please try again.${NC}"; sleep 1 ;;
+    esac
+done
+EOF
+
+    chmod +x /usr/local/bin/menu
+    info "Management menu created. Type 'menu' to use it."
+
+    # --- Create the VPN Monitor Script ---
+    info "Creating vpn-monitor script..."
+    cat > /usr/local/bin/vpn-monitor << 'EOF'
+#!/bin/bash
+# VPN User Monitor for Quota and Expiration
+
+USER_DB="/etc/regarstore/users.db"
+XRAY_API_ADDR="127.0.0.1:10085"
+XRAY_BIN="/usr/local/bin/xray"
+LOG_FILE="/var/log/vpn-monitor.log"
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
+}
+
+remove_user() {
+    local email="$1"
+    local protocol="$2"
+    local reason="$3"
+
+    local inbound_tag="${protocol}-in"
+
+    log "Removing user $email from $protocol due to $reason."
+
+    # Remove from XRAY service
+    $XRAY_BIN api inbound remove --server=$XRAY_API_ADDR --tag="$inbound_tag" --email="$email"
+
+    # Remove from local database
+    sed -i "/^$email;/d" "$USER_DB"
+}
+
+check_users() {
+    if [ ! -f "$USER_DB" ]; then
+        log "User  database not found."
+        exit 1
+    fi
+
+    local current_date_s=$(date +%s)
+
+    while IFS=';' read -r email protocol creds quota_gb ip_limit exp_date; do
+        if [[ "$email" == \#* || -z "$email" ]]; then
+            continue
+        fi
+
+        # --- Check Expiration ---
+        local exp_date_s=$(date -d "$exp_date" +%s)
+        if [[ "$current_date_s" -gt "$exp_date_s" ]]; then
+            remove_user "$email" "$protocol" "expiration"
+            continue
+        fi
+
+        # --- Check Quota ---
+        if [[ "$quota_gb" -gt 0 ]]; then
+            # Query stats for user
+            uplink=$($XRAY_BIN api stats --server=$XRAY_API_ADDR --query "user>>>$email>>>traffic>>>uplink" --reset)
+            downlink=$($XRAY_BIN api stats --server=$XRAY_API_ADDR --query "user>>>$email>>>traffic>>>downlink" --reset)
+
+            # If stats exist, add to a running total
+            if [[ -n "$uplink" && "$downlink" ]]; then
+                # Store usage in a simple file per user
+                usage_file="/etc/regarstore/usage/${email}.usage"
+                mkdir -p /etc/regarstore/usage
+
+                total_usage_bytes=$(($(cat "$usage_file" 2>/dev/null || echo 0) + uplink + downlink))
+                echo "$total_usage_bytes" > "$usage_file"
+
+                quota_bytes=$((quota_gb * 1024 * 1024 * 1024))
+
+                if [[ "$total_usage_bytes" -gt "$quota_bytes" ]]; then
+                    remove_user "$email" "$protocol" "quota exceeded"
+                    rm -f "$usage_file" # Clean up usage file
+                fi
+            fi
+        fi
+    done < "$USER_DB"
+}
+
+log "VPN monitor script started."
+check_users
+log "VPN monitor script finished."
+EOF
+
+    chmod +x /usr/local/bin/vpn-monitor
+    info "VPN monitor script created at /usr/local/bin/vpn-monitor"
+}
+
 finalize_installation() {
     info "Finalizing installation..."
 
-    # --- Add Branding ---
-    info "Adding Regar Store branding to login banner..."
-    echo "========================================" > /etc/motd
-    echo "" >> /etc/motd
-    echo "   Welcome to REGAR STORE VPN Server    " >> /etc/motd
-    echo "" >> /etc/motd
-    echo "   Type 'menu' to manage users/services " >> /etc/motd
-    echo "" >> /etc/motd
-    echo "========================================" >> /etc/motd
+    # --- Add Dynamic MOTD ---
+    info "Setting up dynamic MOTD..."
+    cat > /usr/local/bin/motd_generator << 'EOF'
+#!/bin/bash
+# MOTD Generator for Regar Store VPN
+
+# --- Colors ---
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+# --- Fetch Data ---
+os_info=$(lsb_release -ds)
+ram_info=$(free -h | awk '/^Mem:/ {print $2}')
+cpu_info=$(lscpu | awk -F: '/^Model name/ {print $2}' | sed 's/^[ \t]*//')
+ip_info=$(curl -s ipinfo.io)
+city=$(echo "$ip_info" | jq -r .city)
+isp=$(echo "$ip_info" | jq -r .org)
+ip_vps=$(echo "$ip_info" | jq -r .ip)
+domain=$(cat /root/domain.txt)
+current_time=$(date +"%Y-%m-%d %H:%M:%S")
+version="1.1 (Advanced)"
+
+# --- Display Banner ---
+echo -e "=========================================================================="
+echo -e "         Welcome to ${YELLOW}Regar Store VPN Server${NC}"
+echo -e "=========================================================================="
+echo -e "  • ${CYAN}OS${NC}          : $os_info"
+echo -e "  • ${CYAN}CPU${NC}         : $cpu_info"
+echo -e "  • ${CYAN}RAM${NC}         : $ram_info"
+echo -e "  • ${CYAN}ISP${NC}         : $isp"
+echo -e "  • ${CYAN}CITY${NC}        : $city"
+echo -e "  • ${CYAN}IP VPS${NC}      : $ip_vps"
+echo -e "  • ${CYAN}DOMAIN${NC}      : $domain"
+echo -e "  • ${CYAN}DATE & TIME${NC} : $current_time"
+echo -e "  • ${CYAN}VERSI AUTOSC${NC} : $version"
+echo -e "=========================================================================="
+echo -e "  Type ${YELLOW}'menu'${NC} to manage users and services."
+echo -e "=========================================================================="
+EOF
+    chmod +x /usr/local/bin/motd_generator
+
+    # Create profile script to run motd generator on login
+    echo "/usr/local/bin/motd_generator" > /etc/profile.d/99-regarstore-motd.sh
 
     # --- Setup SSL Auto-Renewal ---
     info "Setting up automatic SSL renewal..."
@@ -730,31 +936,18 @@ main() {
     ask_domain
 
     install_dependencies
-    setup_management_menu
     setup_ssh_tunneling
     setup_openvpn
     setup_xray
     setup_support_services
     setup_security
+    setup_management_menu
 
     finalize_installation
 
     info "Instalasi Selesai! Server akan di-reboot."
-    # Uncomment the next line to enable automatic reboot after installation
     # reboot
 }
 
 # --- Run the script ---
 main
-User  =nobody
-Group=nogroup
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-    systemctl enable badvpn@7100 >/dev/null 2>&1
-    systemctl start badvpn@7100
-    systemctl enable badvpn@720
-    
