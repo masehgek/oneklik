@@ -526,6 +526,7 @@ show_menu() {
     echo " 9. Exit"
     echo "----------------------------------------"
 }
+EOF
 
 # --- XRAY User Management ---
 add_xray_user() {
@@ -756,4 +757,3 @@ main() {
 
 # --- Run the script ---
 main
-EOF
