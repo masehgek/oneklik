@@ -40,8 +40,8 @@ check_root() {
 
 check_os() {
     source /etc/os-release
-    if [[ "${ID}" != "ubuntu" || "${VERSION_ID}" != "22.04" ]]; then
-        error "This script requires Ubuntu 22.04. Your version is ${VERSION_ID}."
+    if [[ "${ID}" != "ubuntu" || "${VERSION_ID}" != "20.04" ]]; then
+        error "This script requires Ubuntu 20.04. Your version is ${VERSION_ID}."
     fi
     info "Operating system check passed."
 }
