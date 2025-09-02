@@ -1,13 +1,6 @@
 #!/bin/bash
 set -e
 
-# =================================================================================
-# Script Name   : VPN Tunnel Premium Installer
-# Description   : Automates the setup of a complete VPN server with XRAY user management.
-# Author        : Jules for Regar Store
-# OS            : Ubuntu 20.04 & 22.04
-# =================================================================================
-
 # --- Color Codes ---
 GREEN='\033[0;32m'
 RED='\033[0;31m'
@@ -39,10 +32,7 @@ check_root() {
 
 check_os() {
     source /etc/os-release
-    if [[ "${ID}" != "ubuntu" || ("${VERSION_ID}" != "20.04" && "${VERSION_ID}" != "22.04") ]]; then
-        error "This script requires Ubuntu 20.04 or 22.04. Your version is ${VERSION_ID}."
-    fi
-    info "Operating system check passed."
+    info "Operating system detected: ${NAME} ${VERSION_ID}"
 }
 
 install_dependencies() {
@@ -57,8 +47,7 @@ install_dependencies() {
         ufw fail2ban \
         unzip zip \
         python3 python3-pip \
-        jq certbot
-
+        jq certbot dnsutils git cmake
     info "Base dependencies installed."
 }
 
@@ -122,8 +111,8 @@ setup_xray() {
   "policy": {
     "levels": {
       "0": {
-        "statsUser Uplink": true,
-        "statsUser Downlink": true
+        "statsUser    Uplink": true,
+        "statsUser    Downlink": true
       }
     },
     "system": {
@@ -219,6 +208,7 @@ setup_support_services() {
     fi
 
     # Badvpn install
+    cd /root
     if ! command -v git &> /dev/null; then
         info "Installing git..."
         apt-get install -y git >/dev/null 2>&1
@@ -227,15 +217,16 @@ setup_support_services() {
         info "Installing cmake..."
         apt-get install -y cmake >/dev/null 2>&1
     fi
-    cd /root
-    git clone https://github.com/ambrop72/badvpn.git >/dev/null 2>&1
-    mkdir -p /root/badvpn/build
-    cd /root/badvpn/build
-    cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 >/dev/null 2>&1
-    make >/dev/null 2>&1
-    mv udpgw/badvpn-udpgw /usr/local/bin/
-    cd /root
-    rm -rf /root/badvpn
+    if [ ! -f /usr/local/bin/badvpn-udpgw ]; then
+        git clone https://github.com/ambrop72/badvpn.git >/dev/null 2>&1
+        mkdir -p /root/badvpn/build
+        cd /root/badvpn/build
+        cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 >/dev/null 2>&1
+        make >/dev/null 2>&1
+        mv udpgw/badvpn-udpgw /usr/local/bin/
+        cd /root
+        rm -rf /root/badvpn
+    fi
 
     cat > /etc/systemd/system/badvpn@.service << EOF
 [Unit]
@@ -245,7 +236,7 @@ After=network.target
 [Service]
 ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr 127.0.0.1:%i --max-clients 512
 Restart=always
-User=nobody
+User =nobody
 Group=nogroup
 
 [Install]
@@ -320,7 +311,6 @@ YELLOW='\033[1;33m'
 NC='\033[0m'
 
 USER_DB="/etc/regarstore/users.db"
-XRAY_API_ADDR="127.0.0.1:10085"
 XRAY_BIN="/usr/local/bin/xray"
 
 press_enter_to_continue() {
@@ -341,6 +331,7 @@ show_menu() {
     echo " 6. Renew SSL Certificate"
     echo " 7. Show User Data Usage"
     echo " 8. Exit"
+    echo " 9. Uninstall All Installed Packages and Configurations"
     echo "----------------------------------------"
 }
 
@@ -370,7 +361,7 @@ add_xray_user() {
 
     if [[ $? -eq 0 ]]; then
         echo "$email;$protocol_name;$creds_for_db;$quota_gb;$ip_limit;$exp_date" >> "$USER_DB"
-        echo -e "${GREEN}User       '$email' for $protocol_name added. Restarting XRAY...${NC}"
+        echo -e "${GREEN}User           '$email' for $protocol_name added. Restarting XRAY...${NC}"
         systemctl restart xray
         echo "UUID/Password: $creds_for_db"
     else
@@ -382,7 +373,7 @@ delete_xray_user() {
     read -p "Enter username (email) to delete: " email
     user_line=$(grep "^$email;" "$USER_DB")
     if [[ -z "$user_line" ]]; then
-        echo -e "${RED}User       '$email' not found in database.${NC}"; return
+        echo -e "${RED}User           '$email' not found in database.${NC}"; return
     fi
 
     protocol_name=$(echo "$user_line" | cut -d';' -f2)
@@ -394,7 +385,7 @@ delete_xray_user() {
 
     if [[ $? -eq 0 ]]; then
         sed -i "/^$email;/d" "$USER_DB"
-        echo -e "${GREEN}User       '$email' removed. Restarting XRAY...${NC}"
+        echo -e "${GREEN}User           '$email' removed. Restarting XRAY...${NC}"
         systemctl restart xray
     else
         echo -e "${RED}Failed to modify xray config file.${NC}"
@@ -418,7 +409,7 @@ show_xray_share_links() {
     while IFS=';' read -r email protocol creds quota_gb ip_limit exp_date; do
         if [[ "$email" == \#* || -z "$email" ]]; then continue; fi
 
-        echo -e "\n${YELLOW}:User       ${email}${NC}"
+        echo -e "\n${YELLOW}:User           ${email}${NC}"
         case $protocol in
             vless)
                 link="vless://${creds}@${DOMAIN}:443?type=ws&path=%2Fvless&security=tls#${email}"
@@ -427,7 +418,7 @@ show_xray_share_links() {
             vmess)
                 json="{\"v\":\"2\",\"ps\":\"${email}\",\"add\":\"${DOMAIN}\",\"port\":\"443\",\"id\":\"${creds}\",\"aid\":0,\"net\":\"ws\",\"type\":\"none\",\"host\":\"${DOMAIN}\",\"path\":\"/vmess\",\"tls\":\"tls\"}"
                 link="vmess://$(echo -n $json | base64 -w 0)"
-                echo -e "${GREEN}$link${NC}"
+                                echo -e "${GREEN}$link${NC}"
                 ;;
             trojan)
                 link="trojan://${creds}@${DOMAIN}:443?type=ws&path=%2Ftrojan&security=tls#${email}"
@@ -437,3 +428,223 @@ show_xray_share_links() {
     done < "$USER_DB"
     echo "----------------------------"
 }
+
+check_xray_status() {
+    systemctl is-active --quiet xray && echo -e "${GREEN}XRAY service is running.${NC}" || echo -e "${RED}XRAY service is NOT running.${NC}"
+}
+
+renew_ssl_certificate() {
+    DOMAIN=$(cat /root/domain.txt)
+    echo -e "${GREEN}Renewing SSL certificate for $DOMAIN...${NC}"
+    systemctl stop xray || true
+    certbot renew --non-interactive --quiet
+    systemctl start xray || true
+    echo -e "${GREEN}SSL certificate renewed.${NC}"
+}
+
+show_user_data_usage() {
+    echo "--- User Data Usage ---"
+    # Placeholder: implement actual data usage retrieval if XRAY API supports it
+    echo "Feature not implemented yet."
+}
+
+uninstall_all() {
+    echo -e "${YELLOW}Starting uninstall process...${NC}"
+
+    # Stop and disable services
+    systemctl stop xray squid fail2ban >/dev/null 2>&1 || true
+    systemctl disable xray squid fail2ban badvpn@7100 badvpn@7200 badvpn@7300 >/dev/null 2>&1 || true
+
+    # Remove xray files
+    rm -f /usr/local/bin/xray
+    rm -rf /usr/local/etc/xray
+    rm -f /root/xray_credentials.txt
+    rm -f /root/domain.txt
+
+    # Backup squid config if exists
+    if [ -f /etc/squid/squid.conf ]; then
+        mv /etc/squid/squid.conf /etc/squid/squid.conf.bak_$(date +%s)
+    fi
+
+    # Remove badvpn binary and service files
+    rm -f /usr/local/bin/badvpn-udpgw
+    rm -f /etc/systemd/system/badvpn@.service
+    systemctl daemon-reload
+
+    # Remove user database and menu
+    rm -rf /etc/regarstore
+    rm -f /usr/local/bin/menu
+
+    # Remove ufw rules added by script
+    ufw delete allow 22/tcp || true
+    ufw delete allow 80/tcp || true
+    ufw delete allow 443/tcp || true
+    ufw delete allow 3128/tcp || true
+    ufw delete allow 8080/tcp || true
+
+    # Optionally reset ufw (commented out)
+    # ufw reset -y
+
+    # Remove installed packages
+    apt-get remove --purge -y \
+        wget curl socat htop cron \
+        build-essential libnss3-dev \
+        zlib1g-dev libssl-dev libgmp-dev \
+        ufw fail2ban \
+        unzip zip \
+        python3 python3-pip \
+        jq certbot dnsutils \
+        squid git cmake
+
+    apt-get autoremove -y
+    apt-get clean
+
+    echo -e "${GREEN}Uninstall process completed.${NC}"
+}
+
+main() {
+    while true; do
+        show_menu
+        read -p "Select an option [1-9]: " choice
+        case $choice in
+            1) add_xray_user; press_enter_to_continue ;;
+            2) delete_xray_user; press_enter_to_continue ;;
+            3) list_xray_users; press_enter_to_continue ;;
+            4) show_xray_share_links; press_enter_to_continue ;;
+            5) check_xray_status; press_enter_to_continue ;;
+            6) renew_ssl_certificate; press_enter_to_continue ;;
+            7) show_user_data_usage; press_enter_to_continue ;;
+            8) echo "Exiting..."; exit 0 ;;
+            9)
+                read -p "Are you sure you want to uninstall everything? [y/N]: " confirm
+                if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                    uninstall_all
+                    echo "Exiting menu after uninstall."
+                    exit 0
+                else
+                    echo "Uninstall cancelled."
+                    press_enter_to_continue
+                fi
+                ;;
+            *) echo -e "${RED}Invalid option.${NC}"; press_enter_to_continue ;;
+        esac
+    done
+}
+
+main
+EOF
+
+    chmod +x /usr/local/bin/menu
+    info "User  management menu installed at /usr/local/bin/menu"
+}
+
+# --- Uninstall function for main script ---
+uninstall_all() {
+    echo -e "${YELLOW}Starting uninstall process...${NC}"
+
+    # Stop and disable services
+    systemctl stop xray squid fail2ban >/dev/null 2>&1 || true
+    systemctl disable xray squid fail2ban badvpn@7100 badvpn@7200 badvpn@7300 >/dev/null 2>&1 || true
+
+    # Remove xray files
+    rm -f /usr/local/bin/xray
+    rm -rf /usr/local/etc/xray
+    rm -f /root/xray_credentials.txt
+    rm -f /root/domain.txt
+
+    # Backup squid config if exists
+    if [ -f /etc/squid/squid.conf ]; then
+        mv /etc/squid/squid.conf /etc/squid/squid.conf.bak_$(date +%s)
+    fi
+
+    # Remove badvpn binary and service files
+    rm -f /usr/local/bin/badvpn-udpgw
+    rm -f /etc/systemd/system/badvpn@.service
+    systemctl daemon-reload
+
+    # Remove user database and menu
+    rm -rf /etc/regarstore
+    rm -f /usr/local/bin/menu
+
+    # Remove ufw rules added by script
+    ufw delete allow 22/tcp || true
+    ufw delete allow 80/tcp || true
+    ufw delete allow 443/tcp || true
+    ufw delete allow 3128/tcp || true
+    ufw delete allow 8080/tcp || true
+
+    # Optionally reset ufw (commented out)
+    # ufw reset -y
+
+    # Remove installed packages
+    apt-get remove --purge -y \
+        wget curl socat htop cron \
+        build-essential libnss3-dev \
+        zlib1g-dev libssl-dev libgmp-dev \
+        ufw fail2ban \
+        unzip zip \
+        python3 python3-pip \
+        jq certbot dnsutils \
+        squid git cmake
+
+    apt-get autoremove -y
+    apt-get clean
+
+    echo -e "${GREEN}Uninstall process completed.${NC}"
+}
+
+# --- Main menu ---
+show_main_menu() {
+    echo "========================================"
+    echo " 1. Setup XRAY and Services"
+    echo " 2. Run User Management Menu"
+    echo " 3. Uninstall All Installed Packages and Configurations"
+    echo " 4. Exit"
+    echo "========================================"
+}
+
+main_menu() {
+    while true; do
+        show_main_menu
+        read -p "Select an option [1-4]: " opt
+        case $opt in
+            1)
+                check_root
+                check_os
+                install_dependencies
+                ask_domain
+                setup_xray
+                setup_support_services
+                setup_security
+                setup_management_menu
+                echo -e "${GREEN}Setup completed. You can run the user management menu by executing: menu${NC}"
+                ;;
+            2)
+                if [ -x /usr/local/bin/menu ]; then
+                    /usr/local/bin/menu
+                else
+                    echo -e "${RED}User  management menu not found. Please run setup first.${NC}"
+                fi
+                ;;
+            3)
+                read -p "Are you sure you want to uninstall everything? [y/N]: " confirm
+                if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                    uninstall_all
+                else
+                    echo "Uninstall cancelled."
+                fi
+                ;;
+            4)
+                echo "Exiting..."
+                exit 0
+                ;;
+            *)
+                echo -e "${RED}Invalid option.${NC}"
+                ;;
+        esac
+    done
+}
+
+# --- Script entrypoint ---
+check_root
+main_menu
