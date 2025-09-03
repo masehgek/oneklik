@@ -1,92 +1,76 @@
 #!/bin/bash
 set -e
 
-# --- Color Codes ---
+# --- Warna ---
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# --- Global Variables ---
-DOMAIN=""
-
-# --- Helper Functions ---
-info() {
-    echo -e "${GREEN}[INFO]${NC} $1"
-}
-
-warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
-}
-
-error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-    exit 1
-}
+# --- Fungsi Bantuan ---
+info() { echo -e "${GREEN}[INFO]${NC} $1"; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
 check_root() {
-    if [[ "${EUID}" -ne 0 ]]; then
-        error "This script must be run as root. Please use 'sudo -i' or 'sudo su'."
+    if [[ $EUID -ne 0 ]]; then
+        error "Jalankan script ini sebagai root."
     fi
-}
-
-check_os() {
-    source /etc/os-release
-    info "Operating system detected: ${NAME} ${VERSION_ID}"
 }
 
 install_dependencies() {
-    info "Updating package lists..."
-    apt-get update >/dev/null 2>&1
-
-    info "Installing base dependencies..."
-    apt-get install -y \
-        wget curl socat htop cron \
-        build-essential libnss3-dev \
-        zlib1g-dev libssl-dev libgmp-dev \
-        ufw fail2ban \
-        unzip zip \
-        python3 python3-pip \
-        jq certbot dnsutils git cmake
-    info "Base dependencies installed."
+    info "Update dan install dependensi..."
+    apt-get update -y
+    apt-get install -y wget curl socat htop cron build-essential libnss3-dev zlib1g-dev libssl-dev libgmp-dev ufw fail2ban unzip zip python3 python3-pip jq certbot dnsutils git cmake squid
 }
 
 ask_domain() {
-    info "Untuk sertifikat SSL, Anda memerlukan sebuah domain."
-    read -p "Silakan masukkan nama domain Anda (contoh: mydomain.com): " DOMAIN
-    if [ -z "$DOMAIN" ]; then
+    read -rp "Masukkan domain Anda (contoh: mydomain.com): " DOMAIN
+    if [[ -z "$DOMAIN" ]]; then
         error "Domain tidak boleh kosong."
     fi
-    info "Domain Anda akan diatur ke: $DOMAIN"
-
     echo "$DOMAIN" > /root/domain.txt
+    info "Domain disimpan: $DOMAIN"
 }
 
-setup_xray() {
-    info "Setting up XRAY (Vmess/Vless/Trojan)..."
-    DOMAIN=$(cat /root/domain.txt)
-
-    info "Installing XRAY core..."
+install_xray() {
+    info "Install Xray core..."
     bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install --without-geodata >/dev/null 2>&1
+}
 
-    info "Checking DNS for $DOMAIN..."
-    local_ip=$(curl -s ifconfig.me)
-    resolved_ip=$(dig +short "$DOMAIN" @8.8.8.8)
+obtain_cert() {
+    DOMAIN=$(cat /root/domain.txt)
+    info "Cek IP VPS dan DNS domain..."
+    VPS_IP=$(curl -s ifconfig.me)
+    DNS_IP=$(dig +short "$DOMAIN" @8.8.8.8)
 
-    if [[ "$local_ip" != "$resolved_ip" ]]; then
-        error "DNS validation failed. Domain '$DOMAIN' points to '$resolved_ip', but VPS IP is '$local_ip'."
+    if [[ "$VPS_IP" != "$DNS_IP" ]]; then
+        error "DNS domain ($DNS_IP) tidak cocok dengan IP VPS ($VPS_IP)."
     fi
-    info "DNS check passed."
 
-    info "Obtaining SSL certificate for $DOMAIN..."
+    info "Menghentikan Xray sementara..."
     systemctl stop xray || true
-    ufw allow 80/tcp
-    certbot certonly --standalone -d "$DOMAIN" --non-interactive --agree-tos -m "admin@$DOMAIN" || error "Failed to obtain SSL certificate."
-    ufw deny 80/tcp
-    systemctl start xray || true
-    info "SSL certificate obtained."
 
-    info "Generating UUIDs and passwords..."
+    info "Membuka port 80 untuk certbot..."
+    ufw allow 80/tcp
+
+    info "Mendapatkan sertifikat SSL untuk $DOMAIN..."
+    certbot certonly --standalone -d "$DOMAIN" --non-interactive --agree-tos -m "admin@$DOMAIN" || error "Gagal mendapatkan sertifikat SSL."
+
+    info "Menutup port 80..."
+    ufw deny 80/tcp
+
+    # Set permission agar user nobody bisa akses sertifikat
+    chmod 755 /etc/letsencrypt/live
+    chmod 755 /etc/letsencrypt/archive
+    chmod 640 /etc/letsencrypt/live/${DOMAIN}/*.pem
+    chgrp nogroup /etc/letsencrypt/live/${DOMAIN}/*.pem
+
+    systemctl start xray || true
+    info "Sertifikat SSL berhasil diperoleh."
+}
+
+generate_credentials() {
     VLESS_UUID=$(/usr/local/bin/xray uuid)
     VMESS_UUID=$(/usr/local/bin/xray uuid)
     TROJAN_PASSWORD=$(openssl rand -base64 16)
@@ -94,8 +78,16 @@ setup_xray() {
     echo "VLESS_UUID=${VLESS_UUID}" > /root/xray_credentials.txt
     echo "VMESS_UUID=${VMESS_UUID}" >> /root/xray_credentials.txt
     echo "TROJAN_PASSWORD=${TROJAN_PASSWORD}" >> /root/xray_credentials.txt
+}
 
-    info "Creating XRAY configuration..."
+create_xray_config() {
+    DOMAIN=$(cat /root/domain.txt)
+    VLESS_UUID=$(grep VLESS_UUID /root/xray_credentials.txt | cut -d= -f2)
+    VMESS_UUID=$(grep VMESS_UUID /root/xray_credentials.txt | cut -d= -f2)
+    TROJAN_PASSWORD=$(grep TROJAN_PASSWORD /root/xray_credentials.txt | cut -d= -f2)
+
+    info "Membuat konfigurasi Xray..."
+
     cat > /usr/local/etc/xray/config.json << EOF
 {
   "log": { "loglevel": "warning" },
@@ -126,7 +118,11 @@ setup_xray() {
       "listen": "127.0.0.1",
       "port": 10085,
       "protocol": "dokodemo-door",
-      "settings": { "address": "127.0.0.1" }
+      "settings": {
+        "address": "127.0.0.1",
+        "port": 10085,
+        "network": "tcp"
+      }
     },
     {
       "port": 443,
@@ -156,14 +152,32 @@ setup_xray() {
       }
     },
     {
-      "port": 8082, "listen": "127.0.0.1", "protocol": "vmess", "tag": "vmess-in",
-      "settings": { "clients": [{"id": "${VMESS_UUID}", "alterId": 0, "email": "user@${DOMAIN}"}] },
-      "streamSettings": { "network": "ws", "security": "none", "wsSettings": { "path": "/vmess" } }
+      "port": 8082,
+      "listen": "127.0.0.1",
+      "protocol": "vmess",
+      "tag": "vmess-in",
+      "settings": {
+        "clients": [ { "id": "${VMESS_UUID}", "alterId": 0, "email": "user@${DOMAIN}" } ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "none",
+        "wsSettings": { "path": "/vmess" }
+      }
     },
     {
-      "port": 8083, "listen": "127.0.0.1", "protocol": "trojan", "tag": "trojan-in",
-      "settings": { "clients": [{"password": "${TROJAN_PASSWORD}", "email": "user@${DOMAIN}"}] },
-      "streamSettings": { "network": "ws", "security": "none", "wsSettings": { "path": "/trojan" } }
+      "port": 8083,
+      "listen": "127.0.0.1",
+      "protocol": "trojan",
+      "tag": "trojan-in",
+      "settings": {
+        "clients": [ { "password": "${TROJAN_PASSWORD}", "email": "user@${DOMAIN}" } ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "none",
+        "wsSettings": { "path": "/trojan" }
+      }
     }
   ],
   "outbounds": [
@@ -187,35 +201,18 @@ EOF
     systemctl daemon-reload
     systemctl enable xray
     systemctl restart xray
-
-    info "XRAY setup completed."
+    info "Konfigurasi Xray selesai dan service dijalankan."
 }
 
-setup_support_services() {
-    info "Setting up Squid Proxy and Badvpn..."
+setup_badvpn() {
+    info "Menginstall dan mengatur Badvpn..."
 
-    # Squid config
-    if [ -f /etc/squid/squid.conf ]; then
-        sed -i 's/http_access deny all/http_access allow all/' /etc/squid/squid.conf
-        grep -q -F "http_port 8080" /etc/squid/squid.conf || echo "http_port 8080" >> /etc/squid/squid.conf
-        grep -q -F "http_port 3128" /etc/squid/squid.conf || echo "http_port 3128" >> /etc/squid/squid.conf
-        DOMAIN=$(cat /root/domain.txt)
-        sed -i "s/# visible_hostname .*/visible_hostname $DOMAIN/" /etc/squid/squid.conf
-        systemctl enable squid >/dev/null 2>&1
-        systemctl restart squid
-    else
-        warn "Squid configuration file not found. Skipping."
-    fi
-
-    # Badvpn install
     cd /root
-    if ! command -v git &> /dev/null; then
-        info "Installing git..."
-        apt-get install -y git >/dev/null 2>&1
+    if ! command -v git &>/dev/null; then
+        apt-get install -y git
     fi
-    if ! command -v cmake &> /dev/null; then
-        info "Installing cmake..."
-        apt-get install -y cmake >/dev/null 2>&1
+    if ! command -v cmake &>/dev/null; then
+        apt-get install -y cmake
     fi
     if [ ! -f /usr/local/bin/badvpn-udpgw ]; then
         git clone https://github.com/ambrop72/badvpn.git >/dev/null 2>&1
@@ -236,7 +233,7 @@ After=network.target
 [Service]
 ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr 127.0.0.1:%i --max-clients 512
 Restart=always
-User =nobody
+User=nobody
 Group=nogroup
 
 [Install]
@@ -248,15 +245,30 @@ EOF
         systemctl enable badvpn@$port
         systemctl start badvpn@$port
     done
-
-    info "Support services setup completed."
+    info "Badvpn service berjalan."
 }
 
-setup_security() {
-    info "Setting up Firewall, Fail2Ban, and BBR..."
+setup_squid() {
+    info "Mengatur Squid Proxy..."
+    if [ -f /etc/squid/squid.conf ]; then
+        sed -i 's/http_access deny all/http_access allow all/' /etc/squid/squid.conf
+        grep -q "http_port 8080" /etc/squid/squid.conf || echo "http_port 8080" >> /etc/squid/squid.conf
+        grep -q "http_port 3128" /etc/squid/squid.conf || echo "http_port 3128" >> /etc/squid/squid.conf
+        DOMAIN=$(cat /root/domain.txt)
+        sed -i "s/# visible_hostname .*/visible_hostname $DOMAIN/" /etc/squid/squid.conf
+        systemctl enable squid
+        systemctl restart squid
+        info "Squid Proxy siap."
+    else
+        warn "File konfigurasi squid tidak ditemukan, melewati."
+    fi
+}
 
-    ufw default deny incoming >/dev/null 2>&1
-    ufw default allow outgoing >/dev/null 2>&1
+setup_firewall_fail2ban_bbr() {
+    info "Mengatur firewall, fail2ban, dan BBR..."
+
+    ufw default deny incoming
+    ufw default allow outgoing
 
     ufw allow 22/tcp
     ufw allow 80/tcp
@@ -266,7 +278,7 @@ setup_security() {
 
     yes | ufw enable
 
-    systemctl enable fail2ban >/dev/null 2>&1
+    systemctl enable fail2ban
     systemctl restart fail2ban
 
     if ! grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf; then
@@ -275,376 +287,154 @@ setup_security() {
     if ! grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf; then
         echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
     fi
-    sysctl -p >/dev/null 2>&1
+    sysctl -p
 
     if sysctl net.ipv4.tcp_congestion_control | grep -q "bbr"; then
-        info "TCP BBR enabled successfully."
+        info "TCP BBR aktif."
     else
-        warn "TCP BBR could not be enabled."
+        warn "TCP BBR gagal diaktifkan."
     fi
-
-    info "Security and performance enhancements completed."
 }
 
-setup_management_menu() {
-    info "Setting up user management menu..."
-
+setup_user_db() {
     mkdir -p /etc/regarstore
     if [ ! -f /etc/regarstore/users.db ]; then
-        cat > /etc/regarstore/users.db << EOF
-# User database: username;protocol;uuid_or_pass;quota_gb;ip_limit;exp_date
-EOF
+        echo "# email;protocol;uuid_or_pass;quota_gb;ip_limit;exp_date" > /etc/regarstore/users.db
     fi
-
-    if ! command -v jq &>/dev/null; then
-        info "Installing jq..."
-        apt-get install -y jq >/dev/null 2>&1
-    fi
-
-    cat > /usr/local/bin/menu << 'EOF'
-#!/bin/bash
-# XRAY User Management Menu (VLESS/VMess/Trojan only)
-
-GREEN='\033[0;32m'
-RED='\033[0;31m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
-
-USER_DB="/etc/regarstore/users.db"
-XRAY_BIN="/usr/local/bin/xray"
-
-press_enter_to_continue() {
-    echo ""
-    read -p "Press Enter to continue..."
-}
-
-show_menu() {
-    clear
-    echo "========================================"
-    echo -e "    ${YELLOW}REGAR STORE - XRAY USER MENU${NC}"
-    echo "========================================"
-    echo " 1. Add XRAY User (VLESS/VMess/Trojan)"
-    echo " 2. Delete XRAY User"
-    echo " 3. List XRAY Users"
-    echo " 4. Show XRAY Share Links"
-    echo " 5. Check XRAY Service Status"
-    echo " 6. Renew SSL Certificate"
-    echo " 7. Show User Data Usage"
-    echo " 8. Exit"
-    echo " 9. Uninstall All Installed Packages and Configurations"
-    echo "----------------------------------------"
 }
 
 add_xray_user() {
-    echo "--- Add XRAY User ---"
-    read -p "Enter username (email format): " email
-    read -p "Select Protocol [1=VLESS, 2=VMess, 3=Trojan]: " proto_choice
-    read -p "Enter Quota (GB, 0 for unlimited): " quota_gb
-    read -p "Enter IP Limit (0 for unlimited): " ip_limit
-    read -p "Enter expiration days (e.g., 30): " days
+    echo "--- Tambah User XRAY ---"
+    read -rp "Masukkan email (username): " email
+    read -rp "Pilih protokol [1=VLESS, 2=VMess, 3=Trojan]: " proto_choice
+    read -rp "Quota (GB, 0 unlimited): " quota_gb
+    read -rp "Limit IP (0 unlimited): " ip_limit
+    read -rp "Masa aktif (hari): " days
 
     exp_date=$(date -d "+$days days" +"%Y-%m-%d")
 
     local protocol_name inbound_tag new_client creds_for_db
 
     case $proto_choice in
-        1) protocol_name="vless"; inbound_tag="vless-in"; creds_for_db=$($XRAY_BIN uuid); new_client=$(jq -n --arg id "$creds_for_db" --arg email "$email" '{id: $id, email: $email, level: 0}') ;;
-        2) protocol_name="vmess"; inbound_tag="vmess-in"; creds_for_db=$($XRAY_BIN uuid); new_client=$(jq -n --arg id "$creds_for_db" --arg email "$email" '{id: $id, email: $email, level: 0}') ;;
-        3) protocol_name="trojan"; inbound_tag="trojan-in"; creds_for_db=$(openssl rand -base64 12); new_client=$(jq -n --arg pass "$creds_for_db" --arg email "$email" '{password: $pass, email: $email, level: 0}') ;;
-        *) echo -e "${RED}Invalid protocol choice.${NC}"; return ;;
+        1)
+            protocol_name="vless"
+            inbound_tag="vless-in"
+            creds_for_db=$(/usr/local/bin/xray uuid)
+            new_client=$(jq -n --arg id "$creds_for_db" --arg email "$email" '{id: $id, email: $email, level: 0}')
+            ;;
+        2)
+            protocol_name="vmess"
+            inbound_tag="vmess-in"
+            creds_for_db=$(/usr/local/bin/xray uuid)
+            new_client=$(jq -n --arg id "$creds_for_db" --arg email "$email" '{id: $id, email: $email, level: 0}')
+            ;;
+        3)
+            protocol_name="trojan"
+            inbound_tag="trojan-in"
+            creds_for_db=$(openssl rand -base64 12)
+            new_client=$(jq -n --arg pass "$creds_for_db" --arg email "$email" '{password: $pass, email: $email, level: 0}')
+            ;;
+        *)
+            echo -e "${RED}Pilihan protokol tidak valid.${NC}"
+            return
+            ;;
     esac
 
     config_file="/usr/local/etc/xray/config.json"
+    backup_file="/usr/local/etc/xray/config.json.bak.$(date +%s)"
     temp_config=$(mktemp)
 
-    jq "(.inbounds[] | select(.tag == \"$inbound_tag\").settings.clients) += [$new_client]" "$config_file" > "$temp_config" && mv "$temp_config" "$config_file"
+    cp "$config_file" "$backup_file"
 
-    if [[ $? -eq 0 ]]; then
-        echo "$email;$protocol_name;$creds_for_db;$quota_gb;$ip_limit;$exp_date" >> "$USER_DB"
-        echo -e "${GREEN}User           '$email' for $protocol_name added. Restarting XRAY...${NC}"
-        systemctl restart xray
-        echo "UUID/Password: $creds_for_db"
+    if jq "(.inbounds[] | select(.tag == \"$inbound_tag\").settings.clients) += [$new_client]" "$config_file" > "$temp_config"; then
+        if jq empty "$temp_config"; then
+            mv "$temp_config" "$config_file"
+            echo "$email;$protocol_name;$creds_for_db;$quota_gb;$ip_limit;$exp_date" >> /etc/regarstore/users.db
+            echo -e "${GREEN}User  $email berhasil ditambahkan. Restart Xray...${NC}"
+            if systemctl restart xray; then
+                echo "UUID/Password: $creds_for_db"
+            else
+                echo -e "${RED}Gagal restart Xray, mengembalikan konfigurasi lama...${NC}"
+                mv "$backup_file" "$config_file"
+                systemctl restart xray
+            fi
+        else
+            echo -e "${RED}Konfigurasi baru tidak valid. Batal menambah user.${NC}"
+            rm "$temp_config"
+        fi
     else
-        echo -e "${RED}Failed to modify xray config file.${NC}"
+        echo -e "${RED}Gagal memodifikasi konfigurasi Xray.${NC}"
+        rm "$temp_config"
     fi
-}
-
-delete_xray_user() {
-    read -p "Enter username (email) to delete: " email
-    user_line=$(grep "^$email;" "$USER_DB")
-    if [[ -z "$user_line" ]]; then
-        echo -e "${RED}User           '$email' not found in database.${NC}"; return
-    fi
-
-    protocol_name=$(echo "$user_line" | cut -d';' -f2)
-    inbound_tag="${protocol_name}-in"
-    config_file="/usr/local/etc/xray/config.json"
-    temp_config=$(mktemp)
-
-    jq "del(.inbounds[] | select(.tag == \"$inbound_tag\").settings.clients[] | select(.email == \"$email\"))" "$config_file" > "$temp_config" && mv "$temp_config" "$config_file"
-
-    if [[ $? -eq 0 ]]; then
-        sed -i "/^$email;/d" "$USER_DB"
-        echo -e "${GREEN}User           '$email' removed. Restarting XRAY...${NC}"
-        systemctl restart xray
-    else
-        echo -e "${RED}Failed to modify xray config file.${NC}"
-    fi
-}
-
-list_xray_users() {
-    echo "--- XRAY User List ---"
-    printf "%-25s | %-8s | %-10s | %-10s | %-12s\n" "Email" "Protocol" "Quota(GB)" "IP Limit" "Expires"
-    echo "-----------------------------------------------------------------------------"
-    while IFS=';' read -r email protocol creds quota_gb ip_limit exp_date; do
-        [[ "$email" == \#* ]] && continue
-        printf "%-25s | %-8s | %-10s | %-10s | %-12s\n" "$email" "$protocol" "$quota_gb" "$ip_limit" "$exp_date"
-    done < "$USER_DB"
-    echo "-----------------------------------------------------------------------------"
 }
 
 show_xray_share_links() {
     DOMAIN=$(cat /root/domain.txt)
-    echo "--- XRAY Shareable Links ---"
+    echo "--- Link Share XRAY ---"
     while IFS=';' read -r email protocol creds quota_gb ip_limit exp_date; do
-        if [[ "$email" == \#* || -z "$email" ]]; then continue; fi
+        [[ "$email" == \#* || -z "$email" ]] && continue
 
-        echo -e "\n${YELLOW}:User           ${email}${NC}"
+        echo -e "\n${YELLOW}:User              ${email}${NC}"
         case $protocol in
             vless)
-                link="vless://${creds}@${DOMAIN}:443?type=ws&path=%2Fvless&security=tls#${email}"
+                path_encoded="%252fvless"
+                host="${DOMAIN}"
+                sni="${DOMAIN}"
+                link="vless://${creds}@${DOMAIN}:443/?security=tls&encryption=none&headerType=none&type=ws&flow=none&host=${host}&path=${path_encoded}&fp=random&sni=${sni}#${email}"
                 echo -e "${GREEN}$link${NC}"
                 ;;
             vmess)
                 json="{\"v\":\"2\",\"ps\":\"${email}\",\"add\":\"${DOMAIN}\",\"port\":\"443\",\"id\":\"${creds}\",\"aid\":0,\"net\":\"ws\",\"type\":\"none\",\"host\":\"${DOMAIN}\",\"path\":\"/vmess\",\"tls\":\"tls\"}"
                 link="vmess://$(echo -n $json | base64 -w 0)"
-                                echo -e "${GREEN}$link${NC}"
-                ;;
-            trojan)
-                link="trojan://${creds}@${DOMAIN}:443?type=ws&path=%2Ftrojan&security=tls#${email}"
                 echo -e "${GREEN}$link${NC}"
                 ;;
+            trojan)
+                path_encoded="%252ftrojan"
+                host="${DOMAIN}"
+                sni="${DOMAIN}"
+                link="trojan://${creds}@${DOMAIN}:443/?type=ws&security=tls&host=${host}&path=${path_encoded}&sni=${sni}#${email}"
+                echo -e "${GREEN}$link${NC}"
+                ;;
+            *)
+                echo -e "${YELLOW}Protokol $protocol tidak didukung untuk link share.${NC}"
+                ;;
         esac
-    done < "$USER_DB"
+    done < /etc/regarstore/users.db
     echo "----------------------------"
 }
 
-check_xray_status() {
-    systemctl is-active --quiet xray && echo -e "${GREEN}XRAY service is running.${NC}" || echo -e "${RED}XRAY service is NOT running.${NC}"
-}
-
-renew_ssl_certificate() {
-    DOMAIN=$(cat /root/domain.txt)
-    echo -e "${GREEN}Renewing SSL certificate for $DOMAIN...${NC}"
-    systemctl stop xray || true
-    certbot renew --non-interactive --quiet
-    systemctl start xray || true
-    echo -e "${GREEN}SSL certificate renewed.${NC}"
-}
-
-show_user_data_usage() {
-    echo "--- User Data Usage ---"
-    # Placeholder: implement actual data usage retrieval if XRAY API supports it
-    echo "Feature not implemented yet."
-}
-
-uninstall_all() {
-    echo -e "${YELLOW}Starting uninstall process...${NC}"
-
-    # Stop and disable services
-    systemctl stop xray squid fail2ban >/dev/null 2>&1 || true
-    systemctl disable xray squid fail2ban badvpn@7100 badvpn@7200 badvpn@7300 >/dev/null 2>&1 || true
-
-    # Remove xray files
-    rm -f /usr/local/bin/xray
-    rm -rf /usr/local/etc/xray
-    rm -f /root/xray_credentials.txt
-    rm -f /root/domain.txt
-
-    # Backup squid config if exists
-    if [ -f /etc/squid/squid.conf ]; then
-        mv /etc/squid/squid.conf /etc/squid/squid.conf.bak_$(date +%s)
-    fi
-
-    # Remove badvpn binary and service files
-    rm -f /usr/local/bin/badvpn-udpgw
-    rm -f /etc/systemd/system/badvpn@.service
-    systemctl daemon-reload
-
-    # Remove user database and menu
-    rm -rf /etc/regarstore
-    rm -f /usr/local/bin/menu
-
-    # Remove ufw rules added by script
-    ufw delete allow 22/tcp || true
-    ufw delete allow 80/tcp || true
-    ufw delete allow 443/tcp || true
-    ufw delete allow 3128/tcp || true
-    ufw delete allow 8080/tcp || true
-
-    # Optionally reset ufw (commented out)
-    # ufw reset -y
-
-    # Remove installed packages
-    apt-get remove --purge -y \
-        wget curl socat htop cron \
-        build-essential libnss3-dev \
-        zlib1g-dev libssl-dev libgmp-dev \
-        ufw fail2ban \
-        unzip zip \
-        python3 python3-pip \
-        jq certbot dnsutils \
-        squid git cmake
-
-    apt-get autoremove -y
-    apt-get clean
-
-    echo -e "${GREEN}Uninstall process completed.${NC}"
+menu() {
+    while true; do
+        clear
+        echo "=============================="
+        echo -e "${YELLOW}Menu Manajemen XRAY${NC}"
+        echo "1) Tambah User XRAY"
+        echo "2) Tampilkan Link Share User"
+        echo "3) Keluar"
+        echo "=============================="
+        read -rp "Pilih menu: " choice
+        case $choice in
+            1) add_xray_user; read -rp "Tekan Enter untuk kembali ke menu...";;
+            2) show_xray_share_links; read -rp "Tekan Enter untuk kembali ke menu...";;
+            3) exit 0;;
+            *) echo "Pilihan tidak valid.";;
+        esac
+    done
 }
 
 main() {
-    while true; do
-        show_menu
-        read -p "Select an option [1-9]: " choice
-        case $choice in
-            1) add_xray_user; press_enter_to_continue ;;
-            2) delete_xray_user; press_enter_to_continue ;;
-            3) list_xray_users; press_enter_to_continue ;;
-            4) show_xray_share_links; press_enter_to_continue ;;
-            5) check_xray_status; press_enter_to_continue ;;
-            6) renew_ssl_certificate; press_enter_to_continue ;;
-            7) show_user_data_usage; press_enter_to_continue ;;
-            8) echo "Exiting..."; exit 0 ;;
-            9)
-                read -p "Are you sure you want to uninstall everything? [y/N]: " confirm
-                if [[ "$confirm" =~ ^[Yy]$ ]]; then
-                    uninstall_all
-                    echo "Exiting menu after uninstall."
-                    exit 0
-                else
-                    echo "Uninstall cancelled."
-                    press_enter_to_continue
-                fi
-                ;;
-            *) echo -e "${RED}Invalid option.${NC}"; press_enter_to_continue ;;
-        esac
-    done
+    check_root
+    install_dependencies
+    ask_domain
+    install_xray
+    obtain_cert
+    generate_credentials
+    create_xray_config
+    setup_badvpn
+    setup_squid
+    setup_firewall_fail2ban_bbr
+    setup_user_db
+    info "Instalasi selesai. Jalankan menu dengan perintah: menu"
 }
 
 main
-EOF
-
-    chmod +x /usr/local/bin/menu
-    info "User  management menu installed at /usr/local/bin/menu"
-}
-
-# --- Uninstall function for main script ---
-uninstall_all() {
-    echo -e "${YELLOW}Starting uninstall process...${NC}"
-
-    # Stop and disable services
-    systemctl stop xray squid fail2ban >/dev/null 2>&1 || true
-    systemctl disable xray squid fail2ban badvpn@7100 badvpn@7200 badvpn@7300 >/dev/null 2>&1 || true
-
-    # Remove xray files
-    rm -f /usr/local/bin/xray
-    rm -rf /usr/local/etc/xray
-    rm -f /root/xray_credentials.txt
-    rm -f /root/domain.txt
-
-    # Backup squid config if exists
-    if [ -f /etc/squid/squid.conf ]; then
-        mv /etc/squid/squid.conf /etc/squid/squid.conf.bak_$(date +%s)
-    fi
-
-    # Remove badvpn binary and service files
-    rm -f /usr/local/bin/badvpn-udpgw
-    rm -f /etc/systemd/system/badvpn@.service
-    systemctl daemon-reload
-
-    # Remove user database and menu
-    rm -rf /etc/regarstore
-    rm -f /usr/local/bin/menu
-
-    # Remove ufw rules added by script
-    ufw delete allow 22/tcp || true
-    ufw delete allow 80/tcp || true
-    ufw delete allow 443/tcp || true
-    ufw delete allow 3128/tcp || true
-    ufw delete allow 8080/tcp || true
-
-    # Optionally reset ufw (commented out)
-    # ufw reset -y
-
-    # Remove installed packages
-    apt-get remove --purge -y \
-        wget curl socat htop cron \
-        build-essential libnss3-dev \
-        zlib1g-dev libssl-dev libgmp-dev \
-        ufw fail2ban \
-        unzip zip \
-        python3 python3-pip \
-        jq certbot dnsutils \
-        squid git cmake
-
-    apt-get autoremove -y
-    apt-get clean
-
-    echo -e "${GREEN}Uninstall process completed.${NC}"
-}
-
-# --- Main menu ---
-show_main_menu() {
-    echo "========================================"
-    echo " 1. Setup XRAY and Services"
-    echo " 2. Run User Management Menu"
-    echo " 3. Uninstall All Installed Packages and Configurations"
-    echo " 4. Exit"
-    echo "========================================"
-}
-
-main_menu() {
-    while true; do
-        show_main_menu
-        read -p "Select an option [1-4]: " opt
-        case $opt in
-            1)
-                check_root
-                check_os
-                install_dependencies
-                ask_domain
-                setup_xray
-                setup_support_services
-                setup_security
-                setup_management_menu
-                echo -e "${GREEN}Setup completed. You can run the user management menu by executing: menu${NC}"
-                ;;
-            2)
-                if [ -x /usr/local/bin/menu ]; then
-                    /usr/local/bin/menu
-                else
-                    echo -e "${RED}User  management menu not found. Please run setup first.${NC}"
-                fi
-                ;;
-            3)
-                read -p "Are you sure you want to uninstall everything? [y/N]: " confirm
-                if [[ "$confirm" =~ ^[Yy]$ ]]; then
-                    uninstall_all
-                else
-                    echo "Uninstall cancelled."
-                fi
-                ;;
-            4)
-                echo "Exiting..."
-                exit 0
-                ;;
-            *)
-                echo -e "${RED}Invalid option.${NC}"
-                ;;
-        esac
-    done
-}
-
-# --- Script entrypoint ---
-check_root
-main_menu
