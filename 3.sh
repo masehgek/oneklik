@@ -526,7 +526,8 @@ setup_firewall_fail2ban_bbr() {
 
     ufw allow 22/tcp
     ufw allow 80/tcp
-    ufw allow 443/tcp    systemctl restart fail2ban
+    ufw allow 443/tcp
+    systemctl restart fail2ban
 
     # Aktifkan BBR
     if ! grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf; then
