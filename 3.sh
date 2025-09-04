@@ -530,12 +530,12 @@ setup_firewall_fail2ban_bbr() {
     ufw allow 3128/tcp
     ufw allow 8080/tcp
 
-    yes | ufw
-    enable
+    echo "y" | ufw enable
 
-    systemctl enable fail2ban
+        systemctl enable fail2ban
     systemctl restart fail2ban
 
+    # Aktifkan BBR
     if ! grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf; then
         echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
     fi
@@ -626,7 +626,7 @@ add_xray_user() {
         if jq empty "$temp_config"; then
             mv "$temp_config" "$config_file"
             echo "$email;$protocol_name;$creds_for_db;$quota_gb;$ip_limit;$exp_date" >> /etc/regarstore/users.db
-            echo -e "${GREEN}User   $email berhasil ditambahkan. Restart Xray...${NC}"
+            echo -e "${GREEN}User    $email berhasil ditambahkan. Restart Xray...${NC}"
             if systemctl restart xray; then
                 echo "UUID/Password: $creds_for_db"
             else
@@ -650,7 +650,7 @@ show_xray_share_links() {
     while IFS=';' read -r email protocol creds quota_gb ip_limit exp_date; do
         [[ "$email" == \#* || -z "$email" ]] && continue
 
-        echo -e "\n${YELLOW}:User                ${email}${NC}"
+        echo -e "\n${YELLOW}:User                 ${email}${NC}"
         case $protocol in
             vless)
                 path_encoded="%252fvless"
