@@ -30,6 +30,7 @@ ask_domain() {
         error "Domain tidak boleh kosong."
     fi
     echo "$DOMAIN" > /root/domain.txt
+    chmod 600 /root/domain.txt
     info "Domain disimpan: $DOMAIN"
 }
 
@@ -64,7 +65,7 @@ obtain_cert() {
     chmod 755 /etc/letsencrypt/live
     chmod 755 /etc/letsencrypt/archive
     chmod 640 /etc/letsencrypt/live/${DOMAIN}/*.pem
-    chgrp nogroup /etc/letsencrypt/live/${DOMAIN}/*.pem
+    chown root:root /etc/letsencrypt/live/${DOMAIN}/*.pem
 
     systemctl start xray || true
     info "Sertifikat SSL berhasil diperoleh."
@@ -78,6 +79,7 @@ generate_credentials() {
     echo "VLESS_UUID=${VLESS_UUID}" > /root/xray_credentials.txt
     echo "VMESS_UUID=${VMESS_UUID}" >> /root/xray_credentials.txt
     echo "TROJAN_PASSWORD=${TROJAN_PASSWORD}" >> /root/xray_credentials.txt
+    chmod 600 /root/xray_credentials.txt
 }
 
 create_xray_config() {
@@ -90,106 +92,402 @@ create_xray_config() {
 
     cat > /usr/local/etc/xray/config.json << EOF
 {
-  "log": { "loglevel": "warning" },
-  "stats": {},
+  "log": {
+    "loglevel": "warning",
+    "error": "/var/log/xray/error.log",
+    "access": "/var/log/xray/access.log"
+  },
   "api": {
-    "tag": "api",
     "services": [
       "HandlerService",
       "LoggerService",
       "StatsService"
-    ]
+    ],
+    "tag": "api"
   },
+  "stats": {},
   "policy": {
     "levels": {
       "0": {
-        "statsUser    Uplink": true,
-        "statsUser    Downlink": true
+        "handshake": 2,
+        "connIdle": 128,
+        "statsUser  Uplink": true,
+        "statsUser  Downlink": true
       }
-    },
-    "system": {
-      "statsInboundUplink": true,
-      "statsInboundDownlink": true
     }
   },
   "inbounds": [
     {
-      "tag": "api-in",
       "listen": "127.0.0.1",
-      "port": 10085,
+      "port": 10000,
       "protocol": "dokodemo-door",
       "settings": {
-        "address": "127.0.0.1",
-        "port": 10085,
-        "network": "tcp"
-      }
+        "address": "127.0.0.1"
+      },
+      "tag": "api"
     },
     {
-      "port": 443,
+      "listen": "127.0.0.1",
+      "port": 10001,
       "protocol": "vless",
-      "tag": "vless-in",
       "settings": {
-        "clients": [ { "id": "${VLESS_UUID}", "level": 0, "email": "user@${DOMAIN}" } ],
         "decryption": "none",
-        "fallbacks": [
-          { "path": "/vmess", "dest": 8082, "xver": 1 },
-          { "path": "/trojan", "dest": 8083, "xver": 1 }
+        "clients": [
+          {
+            "id": "1d1c1d94-6987-4658-a4dc-8821a30fe7e0",
+            "email": "default1"
+          },
+          {
+            "id": "ea1aade2-090d-4847-9ce1-f674063179a3",
+            "email": "default2"
+          },
+          {
+            "id": "486faa2d-f393-4f86-840b-736f3bd308e9",
+            "email": "default3"
+          },
+          {
+            "id": "16b635df-2768-4693-94f7-29143d471914",
+            "email": "default4"
+          },
+          {
+            "id": "97329ab5-5448-4a61-b002-072ac92fa7fc",
+            "email": "default5"
+          }
         ]
       },
       "streamSettings": {
         "network": "ws",
-        "security": "tls",
-        "tlsSettings": {
-          "alpn": ["http/1.1"],
-          "certificates": [
-            {
-              "certificateFile": "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem",
-              "keyFile": "/etc/letsencrypt/live/${DOMAIN}/privkey.pem"
-            }
-          ]
-        },
-        "wsSettings": { "path": "/vless" }
-      }
+        "wsSettings": {
+          "path": "/vless"
+        }
+      },
+      "tag": "vless-in"
     },
     {
-      "port": 8082,
       "listen": "127.0.0.1",
+      "port": 10002,
       "protocol": "vmess",
-      "tag": "vmess-in",
       "settings": {
-        "clients": [ { "id": "${VMESS_UUID}", "alterId": 0, "email": "user@${DOMAIN}" } ]
+        "clients": [
+          {
+            "id": "1d1c1d94-6987-4658-a4dc-8821a30fe7e0",
+            "alterId": 0
+          }
+        ]
       },
       "streamSettings": {
         "network": "ws",
-        "security": "none",
-        "wsSettings": { "path": "/vmess" }
-      }
+        "wsSettings": {
+          "path": "/vmess"
+        }
+      },
+      "tag": "vmess-in"
     },
     {
-      "port": 8083,
       "listen": "127.0.0.1",
+      "port": 10003,
       "protocol": "trojan",
-      "tag": "trojan-in",
       "settings": {
-        "clients": [ { "password": "${TROJAN_PASSWORD}", "email": "user@${DOMAIN}" } ]
+        "decryption": "none",
+        "clients": [
+          {
+            "password": "1d1c1d94-6987-4658-a4dc-8821a30fe7e0"
+          }
+        ],
+        "udp": true
       },
       "streamSettings": {
         "network": "ws",
-        "security": "none",
-        "wsSettings": { "path": "/trojan" }
-      }
+        "wsSettings": {
+          "path": "/trojan-ws"
+        }
+      },
+      "tag": "trojan-in"
+    },
+    {
+      "listen": "127.0.0.1",
+      "port": 10004,
+      "protocol": "shadowsocks",
+      "settings": {
+        "clients": [
+          {
+            "method": "aes-128-gcm",
+            "password": "1d1c1d94-6987-4658-a4dc-8821a30fe7e0"
+          }
+        ],
+        "network": "tcp,udp"
+      },
+      "streamSettings": {
+        "network": "ws",
+        "wsSettings": {
+          "path": "/ss-ws"
+        }
+      },
+      "tag": "ss-in"
+    },
+    {
+      "listen": "127.0.0.1",
+      "port": 10005,
+      "protocol": "vless",
+      "settings": {
+        "decryption": "none",
+        "clients": [
+          {
+            "id": "1d1c1d94-6987-4658-a4dc-8821a30fe7e0",
+            "email": "default1"
+          },
+          {
+            "id": "ea1aade2-090d-4847-9ce1-f674063179a3",
+            "email": "default2"
+          },
+          {
+            "id": "486faa2d-f393-4f86-840b-736f3bd308e9",
+            "email": "default3"
+          },
+          {
+            "id": "16b635df-2768-4693-94f7-29143d471914",
+            "email": "default4"
+          },
+          {
+            "id": "97329ab5-5448-4a61-b002-072ac92fa7fc",
+            "email": "default5"
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "grpc",
+        "grpcSettings": {
+          "serviceName": "vless-grpc"
+        }
+      },
+      "tag": "vless-grpc-in"
+    },
+    {
+      "listen": "127.0.0.1",
+      "port": 10006,
+      "protocol": "vmess",
+      "settings": {
+        "clients": [
+          {
+            "id": "1d1c1d94-6987-4658-a4dc-8821a30fe7e0",
+            "alterId": 0
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "grpc",
+        "grpcSettings": {
+          "serviceName": "vmess-grpc"
+        }
+      },
+      "tag": "vmess-grpc-in"
+    },
+    {
+      "listen": "127.0.0.1",
+      "port": 10007,
+      "protocol": "trojan",
+      "settings": {
+        "decryption": "none",
+        "clients": [
+          {
+            "password": "1d1c1d94-6987-4658-a4dc-8821a30fe7e0"
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "grpc",
+        "grpcSettings": {
+          "serviceName": "trojan-grpc"
+        }
+      },
+      "tag": "trojan-grpc-in"
+    },
+    {
+      "listen": "127.0.0.1",
+      "port": 10008,
+      "protocol": "shadowsocks",
+      "settings": {
+        "clients": [
+          {
+            "method": "aes-128-gcm",
+            "password": "1d1c1d94-6987-4658-a4dc-8821a30fe7e0"
+          }
+        ],
+        "network": "tcp,udp"
+      },
+      "streamSettings": {
+        "network": "grpc",
+        "grpcSettings": {
+          "serviceName": "ss-grpc"
+        }
+      },
+      "tag": "ss-grpc-in"
     }
   ],
   "outbounds": [
-    { "protocol": "freedom", "settings": {} },
-    { "protocol": "blackhole", "settings": {}, "tag": "blocked" }
+    {
+      "protocol": "freedom",
+      "settings": {}
+    },
+    {
+      "protocol": "blackhole",
+      "settings": {},
+      "tag": "blocked"
+    }
   ],
   "routing": {
+    "domainStrategy": "AsIs",
     "rules": [
       {
+        "inboundTag": ["dnsIn"],
+        "outboundTag": "dnsOut",
+        "type": "field"
+      },
+      {
+        "inboundTag": ["dnsQuery"],
+        "outboundTag": "direct",
+        "type": "field"
+      },
+      {
+        "outboundTag": "direct",
+        "protocol": ["bittorrent"],
+        "type": "field"
+      },
+      {
         "type": "field",
-        "inboundTag": [ "api-in" ],
-        "outboundTag": "api"
+        "outboundTag": "block",
+        "ip": [
+          "0.0.0.0/8",
+          "10.0.0.0/8",
+          "100.64.0.0/10",
+          "169.254.0.0/16",
+          "172.16.0.0/12",
+          "192.0.0.0/24",
+          "192.0.2.0/24",
+          "192.168.0.0/16",
+          "198.18.0.0/15",
+          "198.51.100.0/24",
+          "203.0.113.0/24",
+          "::1/128",
+          "fc00::/7",
+          "fe80::/10"
+        ]
+      },
+      {
+        "inboundTag": ["api"],
+        "outboundTag": "api",
+        "type": "field"
+      },
+      {
+        "type": "field",
+        "outboundTag": "blocked",
+        "protocol": ["bittorrent"]
+      },
+      {
+        "type": "field",
+        "outboundTag": "proxy",
+        "ip": [
+          "8.8.8.8/32",
+          "8.8.4.4/32",
+          "geoip:us",
+          "geoip:ca",
+          "geoip:cloudflare",
+          "geoip:cloudfront",
+          "geoip:facebook",
+          "geoip:fastly",
+          "geoip:google",
+          "geoip:googlecn",
+          "geoip:youtube",
+          "geoip:tw",
+          "geoip:jp"
+        ]
+      },
+      {
+        "type": "field",
+        "outboundTag": "block",
+        "ip": [
+          "0.0.0.0/8",
+          "10.0.0.0/8",
+          "100.64.0.0/10",
+          "169.254.0.0/16",
+          "172.16.0.0/12",
+          "192.0.0.0/24",
+          "192.0.2.0/24",
+          "192.168.0.0/16",
+          "198.18.0.0/15",
+          "198.51.100.0/24",
+          "203.0.113.0/24"
+        ]
+      },
+      {
+        "type": "field",
+        "outboundTag": "direct",
+        "ip": [
+          "223.5.5.5/32",
+          "119.29.29.29/32",
+          "180.76.76.76/32",
+          "114.114.114.114/32",
+          "geoip:cn",
+          "geoip:jp",
+          "geoip:in",
+          "geoip:private"
+        ]
+      },
+      {
+        "type": "field",
+        "outboundTag": "reject",
+        "domain": ["geosite:category-ads-all"]
+      },
+      {
+        "type": "field",
+        "outboundTag": "direct",
+        "network": "tcp,udp"
+      }
+    ]
+  },
+  "stats": {},
+  "api": {
+    "services": ["StatsService"],
+    "tag": "api"
+  },
+  "policy": {
+    "levels": {
+      "0": {
+        "statsUser  Downlink": true,
+        "statsUser  Uplink": true
+      }
+    },
+    "system": {
+      "statsInboundUplink": true,
+      "statsInboundDownlink": true,
+      "statsOutboundUplink": true,
+      "statsOutboundDownlink": true
+    }
+  },
+  "dns": {
+    "hosts": {
+      "dns.google": "8.8.8.8",
+      "dns.pub": "119.29.29.29",
+      "dns.alidns.com": "223.5.5.5",
+      "geosite:category-ads-all": "127.0.0.1"
+    },
+    "servers": [
+      {
+        "address": "https://dns.google/dns-query",
+        "domains": ["geosite:geolocation-!cn"],
+        "expectIPs": ["geoip:!cn"]
+      },
+      "8.8.8.8",
+      {
+        "address": "114.114.114.114",
+        "port": 53,
+        "domains": ["geosite:cn", "geosite:category-games@cn"],
+        "expectIPs": ["geoip:cn"],
+        "skipFallback": true
+      },
+      {
+        "address": "localhost",
+        "skipFallback": true
       }
     ]
   }
@@ -202,50 +500,6 @@ EOF
     systemctl enable xray
     systemctl restart xray
     info "Konfigurasi Xray selesai dan service dijalankan."
-}
-
-setup_badvpn() {
-    info "Menginstall dan mengatur Badvpn..."
-
-    cd /root
-    if ! command -v git &>/dev/null; then
-        apt-get install -y git
-    fi
-    if ! command -v cmake &>/dev/null; then
-        apt-get install -y cmake
-    fi
-    if [ ! -f /usr/local/bin/badvpn-udpgw ]; then
-        git clone https://github.com/ambrop72/badvpn.git >/dev/null 2>&1
-        mkdir -p /root/badvpn/build
-        cd /root/badvpn/build
-        cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 >/dev/null 2>&1
-        make >/dev/null 2>&1
-        mv udpgw/badvpn-udpgw /usr/local/bin/
-        cd /root
-        rm -rf /root/badvpn
-    fi
-
-    cat > /etc/systemd/system/badvpn@.service << EOF
-[Unit]
-Description=Badvpn UDP Gateway for Port %i
-After=network.target
-
-[Service]
-ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr 127.0.0.1:%i --max-clients 512
-Restart=always
-User=nobody
-Group=nogroup
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-    for port in 7100 7200 7300; do
-        systemctl enable badvpn@$port
-        systemctl start badvpn@$port
-    done
-    info "Badvpn service berjalan."
 }
 
 setup_squid() {
@@ -276,7 +530,8 @@ setup_firewall_fail2ban_bbr() {
     ufw allow 3128/tcp
     ufw allow 8080/tcp
 
-    yes | ufw enable
+    yes | ufw
+    enable
 
     systemctl enable fail2ban
     systemctl restart fail2ban
@@ -300,16 +555,41 @@ setup_user_db() {
     mkdir -p /etc/regarstore
     if [ ! -f /etc/regarstore/users.db ]; then
         echo "# email;protocol;uuid_or_pass;quota_gb;ip_limit;exp_date" > /etc/regarstore/users.db
+        chmod 600 /etc/regarstore/users.db
     fi
 }
 
 add_xray_user() {
     echo "--- Tambah User XRAY ---"
     read -rp "Masukkan email (username): " email
+    if [[ -z "$email" ]]; then
+        echo -e "${RED}Email tidak boleh kosong.${NC}"
+        return
+    fi
+
     read -rp "Pilih protokol [1=VLESS, 2=VMess, 3=Trojan]: " proto_choice
+    if ! [[ "$proto_choice" =~ ^[123]$ ]]; then
+        echo -e "${RED}Pilihan protokol tidak valid.${NC}"
+        return
+    fi
+
     read -rp "Quota (GB, 0 unlimited): " quota_gb
+    if ! [[ "$quota_gb" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}Quota harus angka.${NC}"
+        return
+    fi
+
     read -rp "Limit IP (0 unlimited): " ip_limit
+    if ! [[ "$ip_limit" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}Limit IP harus angka.${NC}"
+        return
+    fi
+
     read -rp "Masa aktif (hari): " days
+    if ! [[ "$days" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}Masa aktif harus angka.${NC}"
+        return
+    fi
 
     exp_date=$(date -d "+$days days" +"%Y-%m-%d")
 
@@ -334,10 +614,6 @@ add_xray_user() {
             creds_for_db=$(openssl rand -base64 12)
             new_client=$(jq -n --arg pass "$creds_for_db" --arg email "$email" '{password: $pass, email: $email, level: 0}')
             ;;
-        *)
-            echo -e "${RED}Pilihan protokol tidak valid.${NC}"
-            return
-            ;;
     esac
 
     config_file="/usr/local/etc/xray/config.json"
@@ -350,7 +626,7 @@ add_xray_user() {
         if jq empty "$temp_config"; then
             mv "$temp_config" "$config_file"
             echo "$email;$protocol_name;$creds_for_db;$quota_gb;$ip_limit;$exp_date" >> /etc/regarstore/users.db
-            echo -e "${GREEN}User  $email berhasil ditambahkan. Restart Xray...${NC}"
+            echo -e "${GREEN}User   $email berhasil ditambahkan. Restart Xray...${NC}"
             if systemctl restart xray; then
                 echo "UUID/Password: $creds_for_db"
             else
@@ -374,7 +650,7 @@ show_xray_share_links() {
     while IFS=';' read -r email protocol creds quota_gb ip_limit exp_date; do
         [[ "$email" == \#* || -z "$email" ]] && continue
 
-        echo -e "\n${YELLOW}:User              ${email}${NC}"
+        echo -e "\n${YELLOW}:User                ${email}${NC}"
         case $protocol in
             vless)
                 path_encoded="%252fvless"
@@ -403,6 +679,37 @@ show_xray_share_links() {
     echo "----------------------------"
 }
 
+show_bandwidth_usage() {
+    echo "Mengambil data bandwidth dari Xray..."
+
+    API_SOCK="/var/run/xray.sock"
+
+    if [ ! -S "$API_SOCK" ]; then
+        echo -e "${RED}Socket API Xray tidak ditemukan di $API_SOCK${NC}"
+        return
+    fi
+
+    read -r -d '' REQ << EOF
+{
+  "command": "stats",
+  "arguments": {
+    "name": "user>>>"
+  },
+  "tag": "api"
+}
+EOF
+
+    RESPONSE=$(echo "$REQ" | socat - UNIX-CONNECT:"$API_SOCK")
+
+    if [ -z "$RESPONSE" ]; then
+        echo -e "${RED}Gagal mengambil data dari Xray API${NC}"
+        return
+    fi
+
+    echo "Bandwidth usage per user (bytes):"
+    echo "$RESPONSE" | jq -r '.stats[] | select(.name | test("user>>>")) | "\$.name) : Uplink=\$.value.uplink) Downlink=\$.value.downlink)"'
+}
+
 menu() {
     while true; do
         clear
@@ -410,13 +717,15 @@ menu() {
         echo -e "${YELLOW}Menu Manajemen XRAY${NC}"
         echo "1) Tambah User XRAY"
         echo "2) Tampilkan Link Share User"
-        echo "3) Keluar"
+        echo "3) Tampilkan Bandwidth Penggunaan User"
+        echo "4) Keluar"
         echo "=============================="
         read -rp "Pilih menu: " choice
         case $choice in
             1) add_xray_user; read -rp "Tekan Enter untuk kembali ke menu...";;
             2) show_xray_share_links; read -rp "Tekan Enter untuk kembali ke menu...";;
-            3) exit 0;;
+            3) show_bandwidth_usage; read -rp "Tekan Enter untuk kembali ke menu...";;
+            4) exit 0;;
             *) echo "Pilihan tidak valid.";;
         esac
     done
@@ -430,7 +739,6 @@ main() {
     obtain_cert
     generate_credentials
     create_xray_config
-    setup_badvpn
     setup_squid
     setup_firewall_fail2ban_bbr
     setup_user_db
