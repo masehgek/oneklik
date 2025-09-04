@@ -1,7 +1,6 @@
 #!/bin/bash
 set -e
 
-# --- Warna ---
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 YELLOW='\033[1;33m'
@@ -9,7 +8,7 @@ NC='\033[0m'
 
 info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
-error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
+error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
 check_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -17,440 +16,264 @@ check_root() {
     fi
 }
 
-install_dependencies() {
-    info "Update dan install dependensi..."
-    apt-get update -y
-    apt-get install -y wget curl socat htop cron build-essential libnss3-dev zlib1g-dev libssl-dev libgmp-dev ufw fail2ban unzip zip python3 python3-pip jq certbot dnsutils git cmake squid
-}
-
-ask_domain() {
-    read -rp "Masukkan domain Anda (contoh: mydomain.com): " DOMAIN
-    if [[ -z "$DOMAIN" ]]; then
-        error "Domain tidak boleh kosong."
+read_domain() {
+    if [[ -f /root/domain.txt ]]; then
+        DOMAIN=$(cat /root/domain.txt)
+    else
+        read -p "Masukkan domain Anda (contoh: mydomain.com): " DOMAIN
+        if [[ -z "$DOMAIN" ]]; then
+            error "Domain tidak boleh kosong."
+        fi
+        echo "$DOMAIN" > /root/domain.txt
     fi
-    echo "$DOMAIN" > /root/domain.txt
-    chmod 600 /root/domain.txt
-    info "Domain disimpan: $DOMAIN"
 }
 
 install_xray() {
-    info "Install Xray core..."
-    bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install --without-geodata >/dev/null 2>&1
-}
+    info "Memperbarui paket dan menginstal dependensi..."
+    apt update
+    apt install -y curl socat xz-utils wget unzip certbot ufw jq
 
-obtain_cert() {
-    DOMAIN=$(cat /root/domain.txt)
-    info "Cek IP VPS dan DNS domain..."
-    VPS_IP=$(curl -s ifconfig.me)
-    DNS_IP=$(dig +short "$DOMAIN" @8.8.8.8)
+    info "Menginstal XRAY Core..."
+    bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install --without-geodata
 
-    if [[ "$VPS_IP" != "$DNS_IP" ]]; then
-        error "DNS domain ($DNS_IP) tidak cocok dengan IP VPS ($VPS_IP)."
-    fi
+    info "Menghentikan layanan XRAY sementara untuk sertifikat SSL..."
+    systemctl stop xray 2>/dev/null || true
 
-    info "Menghentikan Xray sementara..."
-    systemctl stop xray || true
-
-    info "Membuka port 80 untuk certbot..."
+    info "Membuka port 80 untuk challenge sertifikat SSL..."
     ufw allow 80/tcp
 
-    info "Mendapatkan sertifikat SSL untuk $DOMAIN..."
-    certbot certonly --standalone -d "$DOMAIN" --non-interactive --agree-tos -m "admin@$DOMAIN" || error "Gagal mendapatkan sertifikat SSL."
+    read_domain
 
-    info "Menutup port 80..."
+    info "Mendapatkan sertifikat SSL dari Let's Encrypt untuk domain $DOMAIN..."
+    certbot certonly --standalone -d "$DOMAIN" --non-interactive --agree-tos -m "admin@$DOMAIN"
+
+    info "Menutup port 80 kembali..."
     ufw deny 80/tcp
 
-    chmod 755 /etc/letsencrypt/live
-    chmod 755 /etc/letsencrypt/archive
-    chmod 640 /etc/letsencrypt/live/${DOMAIN}/*.pem
-    chown root:root /etc/letsencrypt/live/${DOMAIN}/*.pem
+    UUID_VLESS=$(xray uuid)
+    UUID_VMESS=$(xray uuid)
+    PASSWORD_TROJAN=$(openssl rand -base64 16)
 
-    systemctl start xray || true
-    info "Sertifikat SSL berhasil diperoleh."
-}
-
-generate_credentials() {
-    VLESS_UUID=$(/usr/local/bin/xray uuid)
-    VMESS_UUID=$(/usr/local/bin/xray uuid)
-    TROJAN_PASSWORD=$(openssl rand -base64 16)
-
-    echo "VLESS_UUID=${VLESS_UUID}" > /root/xray_credentials.txt
-    echo "VMESS_UUID=${VMESS_UUID}" >> /root/xray_credentials.txt
-    echo "TROJAN_PASSWORD=${TROJAN_PASSWORD}" >> /root/xray_credentials.txt
-    chmod 600 /root/xray_credentials.txt
-}
-
-create_xray_config() {
-    DOMAIN=$(cat /root/domain.txt)
-    VLESS_UUID=$(grep VLESS_UUID /root/xray_credentials.txt | cut -d= -f2)
-    VMESS_UUID=$(grep VMESS_UUID /root/xray_credentials.txt | cut -d= -f2)
-    TROJAN_PASSWORD=$(grep TROJAN_PASSWORD /root/xray_credentials.txt | cut -d= -f2)
-
-    info "Membuat konfigurasi Xray..."
+    info "Membuat konfigurasi XRAY..."
 
     cat > /usr/local/etc/xray/config.json << EOF
 {
-  "log": {
-    "loglevel": "warning",
-    "error": "/var/log/xray/error.log",
-    "access": "/var/log/xray/access.log"
-  },
-  "api": {
-    "services": [
-      "HandlerService",
-      "LoggerService",
-      "StatsService"
-    ],
-    "tag": "api"
-  },
-  "stats": {},
-  "policy": {
-    "levels": {
-      "0": {
-        "handshake": 2,
-        "connIdle": 128,
-        "statsUser    Uplink": true,
-        "statsUser    Downlink": true
-      }
-    }
-  },
+  "log": { "loglevel": "warning" },
   "inbounds": [
     {
-      "listen": "127.0.0.1",
-      "port": 10000,
-      "protocol": "dokodemo-door",
-      "settings": {
-        "address": "127.0.0.1"
-      },
-      "tag": "api"
-    },
-    {
-      "listen": "127.0.0.1",
-      "port": 10001,
+      "port": 443,
       "protocol": "vless",
       "settings": {
-        "decryption": "none",
         "clients": [
           {
-            "id": "1d1c1d94-6987-4658-a4dc-8821a30fe7e0",
-            "email": "default1"
+            "id": "$UUID_VLESS",
+            "email": "vless@$DOMAIN"
           }
-        ]
+        ],
+        "decryption": "none"
       },
       "streamSettings": {
         "network": "ws",
+        "security": "tls",
+        "tlsSettings": {
+          "certificates": [
+            {
+              "certificateFile": "/etc/letsencrypt/live/$DOMAIN/fullchain.pem",
+              "keyFile": "/etc/letsencrypt/live/$DOMAIN/privkey.pem"
+            }
+          ]
+        },
         "wsSettings": {
           "path": "/vless"
         }
-      },
-      "tag": "vless-in"
+      }
     },
     {
-      "listen": "127.0.0.1",
-      "port": 10002,
+      "port": 443,
       "protocol": "vmess",
       "settings": {
         "clients": [
           {
-            "id": "1d1c1d94-6987-4658-a4dc-8821a30fe7e0",
-            "alterId": 0
+            "id": "$UUID_VMESS",
+            "alterId": 0,
+            "email": "vmess@$DOMAIN"
           }
         ]
       },
       "streamSettings": {
         "network": "ws",
+        "security": "tls",
+        "tlsSettings": {
+          "certificates": [
+            {
+              "certificateFile": "/etc/letsencrypt/live/$DOMAIN/fullchain.pem",
+              "keyFile": "/etc/letsencrypt/live/$DOMAIN/privkey.pem"
+            }
+          ]
+        },
         "wsSettings": {
           "path": "/vmess"
         }
-      },
-      "tag": "vmess-in"
+      }
     },
     {
-      "listen": "127.0.0.1",
-      "port": 10003,
+      "port": 443,
       "protocol": "trojan",
       "settings": {
-        "decryption": "none",
         "clients": [
           {
-            "password": "1d1c1d94-6987-4658-a4dc-8821a30fe7e0"
+            "password": "$PASSWORD_TROJAN",
+            "email": "trojan@$DOMAIN"
           }
-        ],
-        "udp": true
+        ]
       },
       "streamSettings": {
         "network": "ws",
+        "security": "tls",
+        "tlsSettings": {
+          "certificates": [
+            {
+              "certificateFile": "/etc/letsencrypt/live/$DOMAIN/fullchain.pem",
+              "keyFile": "/etc/letsencrypt/live/$DOMAIN/privkey.pem"
+            }
+          ]
+        },
         "wsSettings": {
-          "path": "/trojan-ws"
+          "path": "/trojan"
         }
-      },
-      "tag": "trojan-in"
+      }
     }
   ],
   "outbounds": [
-    {
-      "protocol": "freedom",
-      "settings": {}
-    },
-    {
-      "protocol": "blackhole",
-      "settings": {},
-      "tag": "blocked"
-    }
+    { "protocol": "freedom" }
   ]
 }
 EOF
 
-    chmod 644 /usr/local/etc/xray/config.json
-
-    systemctl daemon-reload
     systemctl enable xray
     systemctl restart xray
-    info "Konfigurasi Xray selesai dan service dijalankan."
-}
 
-setup_squid() {
-    info "Mengatur Squid Proxy..."
-    if [ -f /etc/squid/squid.conf ]; then
-        sed -i 's/http_access deny all/http_access allow all/' /etc/squid/squid.conf
-        grep -q "http_port 8080" /etc/squid/squid.conf || echo "http_port 8080" >> /etc/squid/squid.conf
-        grep -q "http_port 3128" /etc/squid/squid.conf || echo "http_port 3128" >> /etc/squid/squid.conf
-        DOMAIN=$(cat /root/domain.txt)
-        sed -i "s/# visible_hostname .*/visible_hostname $DOMAIN/" /etc/squid/squid.conf
-        systemctl enable squid
-        systemctl restart squid
-        info "Squid Proxy siap."
-    else
-        warn "File konfigurasi squid tidak ditemukan, melewati."
-    fi
-}
-
-setup_firewall_fail2ban_bbr() {
-    info "Mengatur firewall, fail2ban, dan BBR..."
-
-    ufw default deny incoming
-    ufw default allow outgoing
-
-    ufw allow 22/tcp
-    ufw allow 80/tcp
     ufw allow 443/tcp
-    ufw allow 3128/tcp
-    ufw allow 8080/tcp
+    ufw --force enable
 
-    echo "y" | ufw enable
-
-    systemctl enable fail2ban
-    systemctl restart fail2ban
-
-    # Aktifkan BBR
-    if ! grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf; then
-        echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
-    fi
-    if ! grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf; then
-        echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-    fi
-    sysctl -p
-
-    if sysctl net.ipv4.tcp_congestion_control | grep -q "bbr"; then
-        info "TCP BBR aktif."
-    else
-        warn "TCP BBR gagal diaktifkan."
-    fi
-}
-
-setup_user_db() {
-    mkdir -p /etc/regarstore
-    if [ ! -f /etc/regarstore/users.db ]; then
-        echo "# email;protocol;uuid_or_pass;quota_gb;ip_limit;exp_date" > /etc/regarstore/users.db
-        chmod 600 /etc/regarstore/users.db
-    fi
+    echo -e "\n${GREEN}======================================${NC}"
+    echo -e "${GREEN}XRAY WS (VLESS, VMess, Trojan) sudah terpasang!${NC}"
+    echo -e "Domain: $DOMAIN"
+    echo -e "Port: 443 (WS + TLS)"
+    echo ""
+    echo -e "VLESS:"
+    echo -e "  UUID: $UUID_VLESS"
+    echo -e "  Path: /vless"
+    echo ""
+    echo -e "VMess:"
+    echo -e "  UUID: $UUID_VMESS"
+    echo -e "  Path: /vmess"
+    echo ""
+    echo -e "Trojan:"
+    echo -e "  Password: $PASSWORD_TROJAN"
+    echo -e "  Path: /trojan"
+    echo -e "======================================"
 }
 
 add_xray_user() {
-    echo "--- Tambah User XRAY ---"
-    read -rp "Masukkan email (username): " email
-    if [[ -z "$email" ]]; then
-        echo -e "${RED}Email tidak boleh kosong.${NC}"
+    read_domain
+    echo "Menambah user XRAY baru"
+    read -p "Pilih protokol (vless/vmess/trojan): " protocol
+    protocol=$(echo "$protocol" | tr '[:upper:]' '[:lower:]')
+
+    if [[ "$protocol" != "vless" && "$protocol" != "vmess" && "$protocol" != "trojan" ]]; then
+        echo -e "${RED}Protokol tidak valid.${NC}"
         return
     fi
 
-    read -rp "Pilih protokol [1=VLESS, 2=VMess, 3=Trojan]: " proto_choice
-    if ! [[ "$proto_choice" =~ ^[123]$ ]]; then
-        echo -e "${RED}Pilihan protokol tidak valid.${NC}"
+    read -p "Masukkan username (untuk email tag): " username
+    if [[ -z "$username" ]]; then
+        echo -e "${RED}Username tidak boleh kosong.${NC}"
         return
     fi
 
-    read -rp "Quota (GB, 0 unlimited): " quota_gb
-    if ! [[ "$quota_gb" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}Quota harus angka.${NC}"
-        return
-    fi
-
-    read -rp "Limit IP (0 unlimited): " ip_limit
-    if ! [[ "$ip_limit" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}Limit IP harus angka.${NC}"
-        return
-    fi
-
-    read -rp "Masa aktif (hari): " days
-    if ! [[ "$days" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}Masa aktif harus angka.${NC}"
-        return
-    fi
-
-    exp_date=$(date -d "+$days days" +"%Y-%m-%d")
-
-    local protocol_name inbound_tag new_client creds_for_db
-
-    case $proto_choice in
-        1)
-            protocol_name="vless"
-            inbound_tag="vless-in"
-            creds_for_db=$(/usr/local/bin/xray uuid)
-            new_client=$(jq -n --arg id "$creds_for_db" --arg email "$email" '{id: $id, email: $email, level: 0}')
-            ;;
-        2)
-            protocol_name="vmess"
-            inbound_tag="vmess-in"
-            creds_for_db=$(/usr/local/bin/xray uuid)
-            new_client=$(jq -n --arg id "$creds_for_db" --arg email "$email" '{id: $id, email: $email, level: 0}')
-            ;;
-        3)
-            protocol_name="trojan"
-            inbound_tag="trojan-in"
-            creds_for_db=$(openssl rand -base64 12)
-            new_client=$(jq -n --arg pass "$creds_for_db" --arg email "$email" '{password: $pass, email: $email, level: 0}')
-            ;;
-    esac
-
-    config_file="/usr/local/etc/xray/config.json"
-    backup_file="/usr/local/etc/xray/config.json.bak.$(date +%s)"
-    temp_config=$(mktemp)
-
-    cp "$config_file" "$backup_file"
-
-    if jq "(.inbounds[] | select(.tag == \"$inbound_tag\").settings.clients) += [$new_client]" "$config_file" > "$temp_config"; then
-        if jq empty "$temp_config"; then
-            mv "$temp_config" "$config_file"
-            echo "$email;$protocol_name;$creds_for_db;$quota_gb;$ip_limit;$exp_date" >> /etc/regarstore/users.db
-            echo -e "${GREEN}User      $email berhasil ditambahkan. Restart Xray...${NC}"
-            if systemctl restart xray; then
-                echo "UUID/Password: $creds_for_db"
-            else
-                echo -e "${RED}Gagal restart Xray, mengembalikan konfigurasi lama...${NC}"
-                mv "$backup_file" "$config_file"
-                systemctl restart xray
-            fi
-        else
-            echo -e "${RED}Konfigurasi baru tidak valid. Batal menambah user.${NC}"
-            rm "$temp_config"
+    if [[ "$protocol" == "trojan" ]]; then
+        read -p "Masukkan password untuk Trojan (kosongkan untuk generate otomatis): " pass
+        if [[ -z "$pass" ]]; then
+            pass=$(openssl rand -base64 16)
+            echo "Password di-generate: $pass"
         fi
     else
-        echo -e "${RED}Gagal memodifikasi konfigurasi Xray.${NC}"
-        rm "$temp_config"
+        pass=""
     fi
-}
 
-show_xray_share_links() {
-    DOMAIN=$(cat /root/domain.txt)
-    echo "--- Link Share XRAY ---"
-    while IFS=';' read -r email protocol creds quota_gb ip_limit exp_date; do
-        [[ "$email" == \#* || -z "$email" ]] && continue
-
-        echo -e "\n${YELLOW}:User                   ${email}${NC}"
-        case $protocol in
-            vless)
-                path_encoded="%252fvless"
-                host="${DOMAIN}"
-                sni="${DOMAIN}"
-                link="vless://${creds}@${DOMAIN}:443/?security=tls&encryption=none&headerType=none&type=ws&flow=none&host=${host}&path=${path_encoded}&fp=random&sni=${sni}#${email}"
-                echo -e "${GREEN}$link${NC}"
-                ;;
-            vmess)
-                json="{\"v\":\"2\",\"ps\":\"${email}\",\"add\":\"${DOMAIN}\",\"port\":\"443\",\"id\":\"${creds}\",\"aid\":0,\"net\":\"ws\",\"type\":\"none\",\"host\":\"${DOMAIN}\",\"path\":\"/vmess\",\"tls\":\"tls\"}"
-                link="vmess://$(echo -n $json | base64 -w 0)"
-                echo -e "${GREEN}$link${NC}"
-                ;;
-            trojan)
-                path_encoded="%252ftrojan"
-                host="${DOMAIN}"
-                sni="${DOMAIN}"
-                link="trojan://${creds}@${DOMAIN}:443/?type=ws&security=tls&host=${host}&path=${path_encoded}&sni=${sni}#${email}"
-                echo -e "${GREEN}$link${NC}"
-                ;;
-            *)
-                echo -e "${YELLOW}Protokol $protocol tidak didukung untuk link share.${NC}"
-                ;;
-        esac
-    done < /etc/regarstore/users.db
-    echo "----------------------------"
-}
-
-show_bandwidth_usage() {
-    echo "Mengambil data bandwidth dari Xray..."
-
-    API_SOCK="/var/run/xray.sock"
-
-    if [ ! -S "$API_SOCK" ]; then
-        echo -e "${RED}Socket API Xray tidak ditemukan di $API_SOCK${NC}"
+    config_file="/usr/local/etc/xray/config.json"
+    if [[ ! -f "$config_file" ]]; then
+        echo -e "${RED}File konfigurasi XRAY tidak ditemukan.${NC}"
         return
     fi
 
-    read -r -d '' REQ << EOF
-{
-  "command": "stats",
-  "arguments": {
-    "name": "user>>>"
-  },
-  "tag": "api"
-}
-EOF
-
-    RESPONSE=$(echo "$REQ" | socat - UNIX-CONNECT:"$API_SOCK")
-
-    if [ -z "$RESPONSE" ]; then
-        echo -e "${RED}Gagal mengambil data dari Xray API${NC}"
-        return
+    if [[ "$protocol" != "trojan" ]]; then
+        id=$(xray uuid)
+    else
+        id="$pass"
     fi
 
-    echo "Bandwidth usage per user (bytes):"
-    echo "$RESPONSE" | jq -r '.stats[] | select(.name | test("user>>>")) | "\$.name) : Uplink=\$.value.uplink) Downlink=\$.value.downlink)"'
+    # Tambah user ke config JSON menggunakan jq
+    if [[ "$protocol" == "trojan" ]]; then
+        jq --arg prot "$protocol" --arg password "$id" --arg email "$username@$DOMAIN" \
+           '(.inbounds[] | select(.protocol == $prot) | .settings.clients) += [{"password": $password, "email": $email}]' \
+           "$config_file" > "${config_file}.tmp" && mv "${config_file}.tmp" "$config_file"
+    else
+        jq --arg prot "$protocol" --arg id "$id" --arg email "$username@$DOMAIN" \
+           '(.inbounds[] | select(.protocol == $prot) | .settings.clients) += [{"id": $id, "email": $email}]' \
+           "$config_file" > "${config_file}.tmp" && mv "${config_file}.tmp" "$config_file"
+    fi
+
+    systemctl restart xray
+    echo -e "${GREEN}User  $username berhasil ditambahkan ke protokol $protocol.${NC}"
+}
+
+show_info() {
+    read_domain
+    echo -e "${GREEN}Informasi XRAY saat ini:${NC}"
+    echo "Domain: $DOMAIN"
+    echo "Port: 443 (WS + TLS)"
+    echo "Konfigurasi file: /usr/local/etc/xray/config.json"
+    echo ""
+    echo "Daftar user per protokol:"
+    jq -r '.inbounds[] | "\$.protocol):" + (.settings.clients[]?.email // "Tidak ada user")' /usr/local/etc/xray/config.json 2>/dev/null || echo "Tidak ada data user."
+}
+
+show_bandwidth() {
+    echo -e "${GREEN}Menampilkan bandwidth per user...${NC}"
+    echo "Fitur ini memerlukan konfigurasi monitoring tambahan (misal XRAY stats API atau tools eksternal)."
+    echo "Saat ini belum tersedia data bandwidth per user secara otomatis."
+    echo "Anda bisa mengaktifkan XRAY stats API dan mengolah datanya, atau menggunakan tools monitoring lain."
+    echo ""
+    echo "Contoh sederhana: cek penggunaan bandwidth total server dengan vnstat:"
+    echo "  sudo apt install vnstat"
+    echo "  vnstat -i eth0"
+    echo ""
+    echo "Atau gunakan perintah berikut untuk melihat trafik realtime (butuh instalasi nethogs):"
+    echo "  sudo apt install nethogs"
+    echo "  sudo nethogs"
 }
 
 menu() {
+    check_root
     while true; do
-        clear
-        echo "=============================="
-        echo -e "${YELLOW}Menu Manajemen XRAY${NC}"
-        echo "1) Tambah User XRAY"
-        echo "2) Tampilkan Link Share User"
-        echo "3) Tampilkan Bandwidth Penggunaan User"
-        echo "4) Keluar"
-        echo "=============================="
-        read -rp "Pilih menu: " choice
+        echo -e "\n${GREEN}=== Menu XRAY WS ===${NC}"
+        echo "1) Install XRAY (jika belum)"
+        echo "2) Tambah user XRAY"
+        echo "3) Tampilkan info XRAY"
+        echo "4) Tampilkan bandwidth per user"
+        echo "5) Keluar"
+        read -p "Pilih menu [1-5]: " choice
         case $choice in
-            1) add_xray_user; read -rp "Tekan Enter untuk kembali ke menu...";;
-            2) show_xray_share_links; read -rp "Tekan Enter untuk kembali ke menu...";;
-            3) show_bandwidth_usage; read -rp "Tekan Enter untuk kembali ke menu...";;
-            4) exit 0;;
-            *) echo "Pilihan tidak valid.";;
+            1) install_xray ;;
+            2) add_xray_user ;;
+            3) show_info ;;
+            4) show_bandwidth ;;
+            5) echo "Keluar."; exit 0 ;;
+            *) echo "Pilihan tidak valid." ;;
         esac
     done
 }
 
-main() {
-    check_root
-    install_dependencies
-    ask_domain
-    install_xray
-    obtain_cert
-    generate_credentials
-    create_xray_config
-    setup_squid
-    setup_firewall_fail2ban_bbr
-    setup_user_db
-    info "Instalasi selesai."
-    menu
-}
-
-main
+menu
