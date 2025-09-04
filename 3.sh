@@ -1,19 +1,12 @@
 #!/bin/bash
 set -e
 
-# =================================================================================
-# Script Name   : XRAY Installer + User Management (Fixed JSON edit)
-# Description   : Install XRAY dan kelola user dengan edit config JSON langsung.
-# Author        : Modified for user request
-# =================================================================================
-
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-CONFIG_FILE="/usr/local/etc/xray/config.json"
-USER_DB="/etc/regarstore/users.db"
+DOMAIN=""
 
 info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
@@ -21,57 +14,58 @@ error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
 check_root() {
     if [[ $EUID -ne 0 ]]; then
-        error "Script harus dijalankan sebagai root."
+        error "This script must be run as root."
     fi
 }
 
 install_dependencies() {
-    info "Update dan install dependensi..."
-    apt-get update -y
-    apt-get install -y wget curl socat htop cron build-essential libnss3-dev zlib1g-dev libssl-dev libgmp-dev ufw fail2ban unzip zip python3 python3-pip certbot jq git cmake
+    info "Updating package lists..."
+    apt-get update -y >/dev/null 2>&1
+
+    info "Installing dependencies..."
+    apt-get install -y wget curl socat htop cron build-essential libnss3-dev \
+        zlib1g-dev libssl-dev libgmp-dev ufw fail2ban unzip zip python3 python3-pip \
+        haveged certbot jq git cmake >/dev/null 2>&1
+
+    info "Installing Python WebSocket proxy..."
     pip3 install proxy.py >/dev/null 2>&1
+    info "Dependencies installed."
 }
 
 ask_domain() {
-    read -rp "Masukkan domain Anda (contoh: example.com): " DOMAIN
+    info "Untuk sertifikat SSL, Anda memerlukan sebuah domain."
+    read -rp "Masukkan nama domain Anda (contoh: mydomain.com): " DOMAIN
     if [[ -z "$DOMAIN" ]]; then
         error "Domain tidak boleh kosong."
     fi
+    info "Domain diset ke: $DOMAIN"
     echo "$DOMAIN" > /root/domain.txt
-    info "Domain disimpan: $DOMAIN"
 }
 
-install_xray() {
-    info "Menginstal XRAY core..."
+setup_xray() {
+    info "Menginstall XRAY core..."
     bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install --without-geodata >/dev/null 2>&1
-}
 
-obtain_ssl() {
     DOMAIN=$(cat /root/domain.txt)
+
     info "Mendapatkan sertifikat SSL untuk $DOMAIN..."
     ufw allow 80/tcp
-    if ! certbot certonly --standalone -d "$DOMAIN" --non-interactive --agree-tos -m "admin@$DOMAIN"; then
+    if ! certbot certonly --standalone -d "$DOMAIN" --non-interactive --agree-tos -m "admin@$DOMAIN" --preferred-challenges http; then
         error "Gagal mendapatkan sertifikat SSL. Pastikan domain sudah diarahkan ke IP VPS."
     fi
     ufw deny 80/tcp
     info "Sertifikat SSL berhasil didapatkan."
-}
 
-generate_uuids() {
+    info "Membuat konfigurasi XRAY..."
     VLESS_UUID=$(xray uuid)
     VMESS_UUID=$(xray uuid)
-    TROJAN_PASS=$(openssl rand -base64 16)
-    echo "VLESS_UUID=$VLESS_UUID" > /root/xray_credentials.txt
-    echo "VMESS_UUID=$VMESS_UUID" >> /root/xray_credentials.txt
-    echo "TROJAN_PASS=$TROJAN_PASS" >> /root/xray_credentials.txt
-}
+    TROJAN_PASSWORD=$(openssl rand -base64 16)
 
-create_xray_config() {
-    DOMAIN=$(cat /root/domain.txt)
-    source /root/xray_credentials.txt
+    echo "VLESS_UUID=${VLESS_UUID}" > /root/xray_credentials.txt
+    echo "VMESS_UUID=${VMESS_UUID}" >> /root/xray_credentials.txt
+    echo "TROJAN_PASSWORD=${TROJAN_PASSWORD}" >> /root/xray_credentials.txt
 
-    mkdir -p /usr/local/etc/xray
-    cat > "$CONFIG_FILE" << EOF
+    cat > /usr/local/etc/xray/config.json << EOF
 {
   "log": { "loglevel": "warning" },
   "stats": {},
@@ -113,7 +107,7 @@ create_xray_config() {
         "fallbacks": [
           { "path": "/vmess", "dest": 8082, "xver": 1 },
           { "path": "/trojan", "dest": 8083, "xver": 1 }
-       ]
+        ]
       },
       "streamSettings": {
         "network": "ws",
@@ -143,7 +137,7 @@ create_xray_config() {
       "listen": "127.0.0.1",
       "protocol": "trojan",
       "tag": "trojan-in",
-      "settings": { "clients": [{"password": "${TROJAN_PASS}", "email": "user@${DOMAIN}"}] },
+      "settings": { "clients": [{"password": "${TROJAN_PASSWORD}", "email": "user@${DOMAIN}"}] },
       "streamSettings": { "network": "ws", "security": "none", "wsSettings": { "path": "/trojan" } }
     },
     {
@@ -170,33 +164,24 @@ create_xray_config() {
 }
 EOF
 
-    chown root:root "$CONFIG_FILE"
-    chmod 644 "$CONFIG_FILE"
-    info "Konfigurasi XRAY dibuat."
-}
-
-start_xray() {
-    systemctl daemon-reload
-    systemctl enable xray
+    systemctl enable xray >/dev/null 2>&1
     systemctl restart xray
-    sleep 3
-    if systemctl is-active --quiet xray; then
-        info "XRAY service berjalan dengan baik."
-    else
-        error "XRAY gagal dijalankan. Cek log dengan: journalctl -xeu xray"
-    fi
+
+    info "XRAY setup selesai."
 }
 
 setup_security() {
     info "Mengatur Firewall, Fail2Ban, dan BBR..."
 
-    ufw default deny incoming
-    ufw default allow outgoing
-    ufw allow 443/tcp
+    ufw default deny incoming >/dev/null 2>&1
+    ufw default allow outgoing >/dev/null 2>&1
+
     ufw allow 80/tcp
+    ufw allow 443/tcp
+
     yes | ufw enable
 
-    systemctl enable fail2ban
+    systemctl enable fail2ban >/dev/null 2>&1
     systemctl restart fail2ban
 
     if ! grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf; then
@@ -214,16 +199,40 @@ setup_security() {
         warn "TCP BBR gagal diaktifkan."
     fi
 
-    info "Pengaturan keamanan dan performa selesai."
+    info "Pengaturan keamanan selesai."
+}
+
+generate_vless_url() {
+    local uuid="$1"
+    local domain="$2"
+    local port=443
+    local path="%252fvless"  # URL encoded "/vless"
+    local host="${domain}"
+    local sni="${domain}"
+    local tag="${uuid}"
+
+    echo "vless://${uuid}@${domain}:${port}/?security=tls&encryption=none&headerType=none&type=ws&flow=none&host=${host}&path=${path}&fp=random&sni=${sni}#${tag}"
+}
+
+generate_trojan_url() {
+    local password="$1"
+    local domain="$2"
+    local port=443
+    local path="%2ftrojan"  # URL encoded "/trojan"
+    local host="${domain}"
+    local sni="${domain}"
+    local tag="${password}"
+
+    echo "trojan://${password}@${domain}:${port}/?security=tls&type=ws&host=${host}&headerType=none&path=${path}&sni=${sni}#${tag}"
 }
 
 setup_management_menu() {
     info "Membuat menu manajemen pengguna..."
 
     mkdir -p /etc/regarstore
-    if [ ! -f "$USER_DB" ]; then
-        echo "# Format: username;protocol;uuid_or_pass;quota_gb;ip_limit;exp_date" > "$USER_DB"
-    fi
+    cat > /etc/regarstore/users.db << EOF
+# Format: username;protocol;uuid_or_pass;quota_gb;ip_limit;exp_date
+EOF
 
     cat > /usr/local/bin/menu << 'EOF'
 #!/bin/bash
@@ -233,12 +242,37 @@ YELLOW='\033[1;33m'
 NC='\033[0m'
 
 USER_DB="/etc/regarstore/users.db"
-CONFIG_FILE="/usr/local/etc/xray/config.json"
-XRAY_SERVICE="xray"
+XRAY_API_ADDR="127.0.0.1:10085"
+XRAY_BIN="/usr/local/bin/xray"
+DOMAIN=$(cat /root/domain.txt)
 
 press_enter_to_continue() {
     echo ""
-    read -p "Press Enter to continue..."
+    read -p "Tekan Enter untuk melanjutkan..."
+}
+
+generate_vless_url() {
+    local uuid="$1"
+    local domain="$2"
+    local port=443
+    local path="%252fvless"
+    local host="${domain}"
+    local sni="${domain}"
+    local tag="${uuid}"
+
+    echo "vless://${uuid}@${domain}:${port}/?security=tls&encryption=none&headerType=none&type=ws&flow=none&host=${host}&path=${path}&fp=random&sni=${sni}#${tag}"
+}
+
+generate_trojan_url() {
+    local password="$1"
+    local domain="$2"
+    local port=443
+    local path="%2ftrojan"
+    local host="${domain}"
+    local sni="${domain}"
+    local tag="${password}"
+
+    echo "trojan://${password}@${domain}:${port}/?security=tls&type=ws&host=${host}&headerType=none&path=${path}&sni=${sni}#${tag}"
 }
 
 show_menu() {
@@ -246,132 +280,112 @@ show_menu() {
     echo "========================================"
     echo -e "    ${YELLOW}REGAR STORE - VPN SERVER MENU${NC}"
     echo "========================================"
-    echo " 1. Add XRAY User (VLESS/VMess/Trojan)"
-    echo " 2. Delete XRAY User"
-    echo " 3. List XRAY Users"
-    echo " 4. Check XRAY Service Status"
-    echo " 5. Renew SSL Certificate"
+    echo " 1. Tambah User XRAY (VLESS/VMess/Trojan)"
+    echo " 2. Hapus User XRAY"
+    echo " 3. Daftar User XRAY"
+    echo " 4. Cek Status Service"
+    echo " 5. Perbarui Sertifikat SSL"
     echo " 6. Reboot Server"
-    echo " 7. Exit"
+    echo " 7. Keluar"
     echo "----------------------------------------"
 }
 
-add_user() {
-    echo "--- Add XRAY User ---"
-    read -p "Enter username (email format): " email
-    read -p "Select Protocol [1=VLESS, 2=VMess, 3=Trojan]: " proto_choice
-    read -p "Enter Quota (GB, 0 for unlimited): " quota_gb
-    read -p "Enter IP Limit (0 for unlimited): " ip_limit
-    read -p "Enter expiration days (e.g., 30): " days
+add_xray_user() {
+    echo "--- Tambah User XRAY ---"
+    read -rp "Masukkan username (format email, misal user@domain.com): " email
+    read -rp "Pilih protokol [1=VLESS, 2=VMess, 3=Trojan]: " proto_choice
+    read -rp "Masukkan kuota (GB, 0 untuk unlimited): " quota_gb
+    read -rp "Masukkan batas IP (0 untuk unlimited): " ip_limit
+    read -rp "Masukkan masa aktif (hari, misal 30): " days
 
     exp_date=$(date -d "+$days days" +"%Y-%m-%d")
 
-    local protocol inbound_tag client_id client_pass
+    local protocol_name inbound_tag creds_id creds_pass settings
 
     case $proto_choice in
-        1)
-            protocol="vless"
-            inbound_tag="vless-in"
-            client_id=$(xray uuid)
-            ;;
-        2)
-            protocol="vmess"
-            inbound_tag="vmess-in"
-            client_id=$(xray uuid)
-            ;;
-        3)
-            protocol="trojan"
-            inbound_tag="trojan-in"
-            client_pass=$(openssl rand -base64 12)
-            ;;
-        *)
-            echo -e "${RED}Invalid protocol choice.${NC}"
-            return
-            ;;
+        1) protocol_name="vless"; inbound_tag="vless-in"; creds_id=$($XRAY_BIN uuid) ;;
+        2) protocol_name="vmess"; inbound_tag="vmess-in"; creds_id=$($XRAY_BIN uuid) ;;
+        3) protocol_name="trojan"; inbound_tag="trojan-in"; creds_pass=$(openssl rand -base64 12) ;;
+        *) echo -e "${RED}Pilihan protokol tidak valid.${NC}"; return ;;
     esac
 
-    # Backup config
-    cp "$CONFIG_FILE" "${CONFIG_FILE}.bak"
-
-    if [[ "$protocol" == "trojan" ]]; then
-        # Add trojan client
-        tmpfile=$(mktemp)
-        jq --arg pass "$client_pass" --arg email "$email" \
-           '(.inbounds[] | select(.tag == "trojan-in") | .settings.clients) += [{"password": $pass, "email": $email}]' \
-           "$CONFIG_FILE" > "$tmpfile" && mv "$tmpfile" "$CONFIG_FILE"
-        creds="$client_pass"
+    if [[ -n "$creds_pass" ]]; then
+        settings="{\"clients\": [{\"password\": \"$creds_pass\", \"email\": \"$email\", \"level\": 0}]}"
+        creds_for_db=$creds_pass
     else
-        # Add vless or vmess client
-        tmpfile=$(mktemp)
-        jq --arg id "$client_id" --arg email "$email" \
-           '(.inbounds[] | select(.tag == $inbound_tag) | .settings.clients) += [{"id": $id, "level": 0, "email": $email}]' \
-           --arg inbound_tag "$inbound_tag" "$CONFIG_FILE" > "$tmpfile" && mv "$tmpfile" "$CONFIG_FILE"
-        creds="$client_id"
+        settings="{\"clients\": [{\"id\": \"$creds_id\", \"email\": \"$email\", \"level\": 0}]}"
+        creds_for_db=$creds_id
     fi
 
-    systemctl restart "$XRAY_SERVICE"
+    result=$($XRAY_BIN api inbound add --server=$XRAY_API_ADDR --tag=$inbound_tag --protocol=$protocol_name --settings="$settings" 2>&1)
 
-    echo "$email;$protocol;$creds;$quota_gb;$ip_limit;$exp_date" >> "$USER_DB"
-    echo -e "${GREEN}User  '$email' ($protocol) berhasil ditambahkan.${NC}"
-    echo "UUID/Password: $creds"
+    if [[ $? -eq 0 ]]; then
+        echo "$email;$protocol_name;$creds_for_db;$quota_gb;$ip_limit;$exp_date" >> "$USER_DB"
+        echo -e "${GREEN}User   '$email' untuk $protocol_name berhasil ditambahkan.${NC}"
+        if [[ "$protocol_name" == "vless" ]]; then
+            vless_url=$(generate_vless_url "$creds_for_db" "$DOMAIN")
+            echo -e "${GREEN}URL VLESS:${NC} $vless_url"
+        elif [[ "$protocol_name" == "trojan" ]]; then
+            trojan_url=$(generate_trojan_url "$creds_for_db" "$DOMAIN")
+            echo -e "${GREEN}URL Trojan:${NC} $trojan_url"
+        else
+            echo "Credentials: $creds_for_db"
+        fi
+    else
+        echo -e "${RED}Gagal menambahkan user ke XRAY. Error: $result${NC}"
+    fi
 }
 
-delete_user() {
-    echo "--- Delete XRAY User ---"
-    read -p "Enter username (email) to delete: " email
+delete_xray_user() {
+    read -rp "Masukkan username (email) yang akan dihapus: " email
 
-    if ! grep -q "^$email;" "$USER_DB"; then
-        echo -e "${RED}User  '$email' tidak ditemukan.${NC}"
+    user_line=$(grep "^$email;" "$USER_DB")
+    if [[ -z "$user_line" ]]; then
+        echo -e "${RED}User   '$email' tidak ditemukan di database.${NC}"
         return
     fi
 
-    protocol=$(grep "^$email;" "$USER_DB" | cut -d';' -f2)
-    creds=$(grep "^$email;" "$USER_DB" | cut -d';' -f3)
-    inbound_tag="${protocol}-in"
+    protocol_name=$(echo "$user_line" | cut -d';' -f2)
+    inbound_tag="${protocol_name}-in"
 
-    # Backup config
-    cp "$CONFIG_FILE" "${CONFIG_FILE}.bak"
+    result=$($XRAY_BIN api inbound remove --server=$XRAY_API_ADDR --tag="$inbound_tag" --email="$email" 2>&1)
 
-    if [[ "$protocol" == "trojan" ]]; then
-        tmpfile=$(mktemp)
-        jq --arg pass "$creds" \
-           '(.inbounds[] | select(.tag == "trojan-in") | .settings.clients) |= map(select(.password != $pass))' \
-           "$CONFIG_FILE" > "$tmpfile" && mv "$tmpfile" "$CONFIG_FILE"
+    if [[ $? -eq 0 ]]; then
+        sed -i "/^$email;/d" "$USER_DB"
+        echo -e "${GREEN}User   '$email' berhasil dihapus dari $protocol_name.${NC}"
     else
-        tmpfile=$(mktemp)
-        jq --arg id "$creds" \
-           '(.inbounds[] | select(.tag == "'$inbound_tag'") | .settings.clients) |= map(select(.id != $id))' \
-           "$CONFIG_FILE" > "$tmpfile" && mv "$tmpfile" "$CONFIG_FILE"
+        echo -e "${RED}Gagal menghapus user dari XRAY. Error: $result${NC}"
     fi
-
-    systemctl restart "$XRAY_SERVICE"
-
-    sed -i "/^$email;/d" "$USER_DB"
-    echo -e "${GREEN}User  '$email' berhasil dihapus.${NC}"
 }
 
-list_users() {
+list_xray_users() {
     echo "--- Daftar User XRAY ---"
-    printf "%-25s | %-8s | %-36s | %-10s | %-10s | %-12s\n" "Email" "Protocol" "UUID/Password" "Quota(GB)" "IP Limit" "Expires"
-    echo "---------------------------------------------------------------------------------------------------------------"
-    grep -v '^#' "$USER_DB" | while IFS=';' read -r email protocol creds quota ip_limit exp_date; do
-        printf "%-25s | %-8s | %-36s | %-10s | %-10s | %-12s\n" "$email" "$protocol" "$creds" "$quota" "$ip_limit" "$exp_date"
-    done
-    echo "---------------------------------------------------------------------------------------------------------------"
+    printf "%-30s | %-8s | %-10s | %-10s | %-12s\n" "Email" "Protokol" "Kuota(GB)" "Batas IP" "Kadaluarsa"
+    echo "--------------------------------------------------------------------------------"
+    while IFS=';' read -r email protocol creds quota_gb ip_limit exp_date; do
+        [[ "$email" == \#* ]] && continue
+        printf "%-30s | %-8s | %-10s | %-10s | %-12s\n" "$email" "$protocol" "$quota_gb" "$ip_limit" "$exp_date"
+    done < "$USER_DB"
+    echo "--------------------------------------------------------------------------------"
 }
 
-check_service() {
-    echo "--- Status Service XRAY ---"
-    if systemctl is-active --quiet xray; then
-        echo -e "xray: ${GREEN}Running${NC}"
-    else
-        echo -e "xray: ${RED}Stopped${NC}"
-    fi
+check_services() {
+    echo "--- Status Service ---"
+    SERVICES=("xray")
+    for service in "${SERVICES[@]}"; do
+        if systemctl is-active --quiet "$service"; then
+            echo -e "$service: ${GREEN}Berjalan${NC}"
+        else
+            echo -e "$service: ${RED}Berhenti${NC}"
+        fi
+    done
+    echo "----------------------"
 }
 
 renew_ssl() {
-    echo "Renewing SSL certificate..."
+    echo "Memperbarui Sertifikat SSL..."
     certbot renew --quiet
+    systemctl restart xray
     echo "Selesai."
 }
 
@@ -379,50 +393,47 @@ while true; do
     show_menu
     read -rp "Pilih menu [1-7]: " choice
     case $choice in
-        1) add_user; press_enter_to_continue ;;
-        2) delete_user; press_enter_to_continue ;;
-        3) list_users; press_enter_to_continue ;;
-        4) check_service; press_enter_to_continue ;;
+        1) add_xray_user; press_enter_to_continue ;;
+        2) delete_xray_user; press_enter_to_continue ;;
+        3) list_xray_users; press_enter_to_continue ;;
+        4) check_services; press_enter_to_continue ;;
         5) renew_ssl; press_enter_to_continue ;;
         6) reboot ;;
         7) exit 0 ;;
-        *) echo -e "${RED}Pilihan tidak valid.${NC}"; sleep 1 ;;
+        *) echo -e "${RED}Pilihan tidak valid. Coba lagi.${NC}"; sleep 1 ;;
     esac
 done
 EOF
 
     chmod +x /usr/local/bin/menu
-    info "Menu manajemen pengguna siap. Ketik 'menu' untuk menggunakannya."
+    info "Menu manajemen dibuat. Ketik 'menu' untuk menggunakannya."
 }
 
 finalize_installation() {
-    info "Finalisasi instalasi..."
+    info "Menyelesaikan instalasi..."
 
-    echo "========================================" > /etc/motd
-    echo "" >> /etc/motd
-    echo "   Welcome to REGAR STORE VPN Server    " >> /etc/motd
-    echo "" >> /etc/motd
-    echo "   Ketik 'menu' untuk mengelola pengguna dan layanan " >> /etc/motd
-    echo "" >> /etc/motd
-    echo "========================================" >> /etc/motd
+    cat > /etc/motd << EOF
+========================================
 
-    (crontab -l 2>/dev/null; echo "0 5 * * * /usr/bin/certbot renew --quiet") | crontab -
+   Welcome to REGAR STORE VPN Server
+
+   Ketik 'menu' untuk mengelola pengguna dan layanan
+
+========================================
+EOF
+
+    (crontab -l 2>/dev/null; echo "0 5 * * * /usr/bin/certbot renew --quiet --pre-hook 'systemctl stop xray' --post-hook 'systemctl start xray'") | crontab -
 
     info "Instalasi selesai! Silakan reboot server."
 }
 
 main() {
     check_root
-    warn "Pastikan domain Anda sudah di-pointing ke IP Address VPS ini."
     ask_domain
     install_dependencies
-    setup_management_menu
-    install_xray
-    obtain_ssl
-    generate_uuids
-    create_xray_config
-    start_xray
+    setup_xray
     setup_security
+    setup_management_menu
     finalize_installation
 }
 
