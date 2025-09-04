@@ -7,7 +7,6 @@ RED='\033[0;31m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-# --- Fungsi Bantuan ---
 info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
@@ -61,7 +60,6 @@ obtain_cert() {
     info "Menutup port 80..."
     ufw deny 80/tcp
 
-    # Set permission agar user nobody bisa akses sertifikat
     chmod 755 /etc/letsencrypt/live
     chmod 755 /etc/letsencrypt/archive
     chmod 640 /etc/letsencrypt/live/${DOMAIN}/*.pem
@@ -111,8 +109,8 @@ create_xray_config() {
       "0": {
         "handshake": 2,
         "connIdle": 128,
-        "statsUser   Uplink": true,
-        "statsUser   Downlink": true
+        "statsUser    Uplink": true,
+        "statsUser    Downlink": true
       }
     }
   },
@@ -136,22 +134,6 @@ create_xray_config() {
           {
             "id": "1d1c1d94-6987-4658-a4dc-8821a30fe7e0",
             "email": "default1"
-          },
-          {
-            "id": "ea1aade2-090d-4847-9ce1-f674063179a3",
-            "email": "default2"
-          },
-          {
-            "id": "486faa2d-f393-4f86-840b-736f3bd308e9",
-            "email": "default3"
-          },
-          {
-            "id": "16b635df-2768-4693-94f7-29143d471914",
-            "email": "default4"
-          },
-          {
-            "id": "97329ab5-5448-4a61-b002-072ac92fa7fc",
-            "email": "default5"
           }
         ]
       },
@@ -203,125 +185,6 @@ create_xray_config() {
         }
       },
       "tag": "trojan-in"
-    },
-    {
-      "listen": "127.0.0.1",
-      "port": 10004,
-      "protocol": "shadowsocks",
-      "settings": {
-        "clients": [
-          {
-            "method": "aes-128-gcm",
-            "password": "1d1c1d94-6987-4658-a4dc-8821a30fe7e0"
-          }
-        ],
-        "network": "tcp,udp"
-      },
-      "streamSettings": {
-        "network": "ws",
-        "wsSettings": {
-          "path": "/ss-ws"
-        }
-      },
-      "tag": "ss-in"
-    },
-    {
-      "listen": "127.0.0.1",
-      "port": 10005,
-      "protocol": "vless",
-      "settings": {
-        "decryption": "none",
-        "clients": [
-          {
-            "id": "1d1c1d94-6987-4658-a4dc-8821a30fe7e0",
-            "email": "default1"
-          },
-          {
-            "id": "ea1aade2-090d-4847-9ce1-f674063179a3",
-            "email": "default2"
-          },
-          {
-            "id": "486faa2d-f393-4f86-840b-736f3bd308e9",
-            "email": "default3"
-          },
-          {
-            "id": "16b635df-2768-4693-94f7-29143d471914",
-            "email": "default4"
-          },
-          {
-            "id": "97329ab5-5448-4a61-b002-072ac92fa7fc",
-            "email": "default5"
-          }
-        ]
-      },
-      "streamSettings": {
-        "network": "grpc",
-        "grpcSettings": {
-          "serviceName": "vless-grpc"
-        }
-      },
-      "tag": "vless-grpc-in"
-    },
-    {
-      "listen": "127.0.0.1",
-      "port": 10006,
-      "protocol": "vmess",
-      "settings": {
-        "clients": [
-          {
-            "id": "1d1c1d94-6987-4658-a4dc-8821a30fe7e0",
-            "alterId": 0
-          }
-        ]
-      },
-      "streamSettings": {
-        "network": "grpc",
-        "grpcSettings": {
-          "serviceName": "vmess-grpc"
-        }
-      },
-      "tag": "vmess-grpc-in"
-    },
-    {
-      "listen": "127.0.0.1",
-      "port": 10007,
-      "protocol": "trojan",
-      "settings": {
-        "decryption": "none",
-        "clients": [
-          {
-            "password": "1d1c1d94-6987-4658-a4dc-8821a30fe7e0"
-          }
-        ]
-      },
-      "streamSettings": {
-        "network": "grpc",
-        "grpcSettings": {
-          "serviceName": "trojan-grpc"
-        }
-      },
-      "tag": "trojan-grpc-in"
-    },
-    {
-      "listen": "127.0.0.1",
-      "port": 10008,
-      "protocol": "shadowsocks",
-      "settings": {
-        "clients": [
-          {
-            "method": "aes-128-gcm",
-            "password": "1d1c1d94-6987-4658-a4dc-8821a30fe7e0"
-          }
-        ],
-        "network": "tcp,udp"
-      },
-      "streamSettings": {
-        "network": "grpc",
-        "grpcSettings": {
-          "serviceName": "ss-grpc"
-        }
-      },
-      "tag": "ss-grpc-in"
     }
   ],
   "outbounds": [
@@ -334,163 +197,7 @@ create_xray_config() {
       "settings": {},
       "tag": "blocked"
     }
-  ],
-  "routing": {
-    "domainStrategy": "AsIs",
-    "rules": [
-      {
-        "inboundTag": ["dnsIn"],
-        "outboundTag": "dnsOut",
-        "type": "field"
-      },
-      {
-        "inboundTag": ["dnsQuery"],
-        "outboundTag": "direct",
-        "type": "field"
-      },
-      {
-        "outboundTag": "direct",
-        "protocol": ["bittorrent"],
-        "type": "field"
-      },
-      {
-        "type": "field",
-        "outboundTag": "block",
-        "ip": [
-          "0.0.0.0/8",
-          "10.0.0.0/8",
-          "100.64.0.0/10",
-          "169.254.0.0/16",
-          "172.16.0.0/12",
-          "192.0.0.0/24",
-          "192.0.2.0/24",
-          "192.168.0.0/16",
-          "198.18.0.0/15",
-          "198.51.100.0/24",
-          "203.0.113.0/24",
-          "::1/128",
-          "fc00::/7",
-          "fe80::/10"
-        ]
-      },
-      {
-        "inboundTag": ["api"],
-        "outboundTag": "api",
-        "type": "field"
-      },
-      {
-        "type": "field",
-        "outboundTag": "blocked",
-        "protocol": ["bittorrent"]
-      },
-      {
-        "type": "field",
-        "outboundTag": "proxy",
-        "ip": [
-          "8.8.8.8/32",
-          "8.8.4.4/32",
-          "geoip:us",
-          "geoip:ca",
-          "geoip:cloudflare",
-          "geoip:cloudfront",
-          "geoip:facebook",
-          "geoip:fastly",
-          "geoip:google",
-          "geoip:googlecn",
-          "geoip:youtube",
-          "geoip:tw",
-          "geoip:jp"
-        ]
-      },
-      {
-        "type": "field",
-        "outboundTag": "block",
-        "ip": [
-          "0.0.0.0/8",
-          "10.0.0.0/8",
-          "100.64.0.0/10",
-          "169.254.0.0/16",
-          "172.16.0.0/12",
-          "192.0.0.0/24",
-          "192.0.2.0/24",
-          "192.168.0.0/16",
-          "198.18.0.0/15",
-          "198.51.100.0/24",
-          "203.0.113.0/24"
-        ]
-      },
-      {
-        "type": "field",
-        "outboundTag": "direct",
-        "ip": [
-          "223.5.5.5/32",
-          "119.29.29.29/32",
-          "180.76.76.76/32",
-          "114.114.114.114/32",
-          "geoip:cn",
-          "geoip:jp",
-          "geoip:in",
-          "geoip:private"
-        ]
-      },
-      {
-        "type": "field",
-        "outboundTag": "reject",
-        "domain": ["geosite:category-ads-all"]
-      },
-      {
-        "type": "field",
-        "outboundTag": "direct",
-        "network": "tcp,udp"
-      }
-    ]
-  },
-  "stats": {},
-  "api": {
-    "services": ["StatsService"],
-    "tag": "api"
-  },
-  "policy": {
-    "levels": {
-      "0": {
-        "statsUser   Downlink": true,
-        "statsUser   Uplink": true
-      }
-    },
-    "system": {
-      "statsInboundUplink": true,
-      "statsInboundDownlink": true,
-      "statsOutboundUplink": true,
-      "statsOutboundDownlink": true
-    }
-  },
-  "dns": {
-    "hosts": {
-      "dns.google": "8.8.8.8",
-      "dns.pub": "119.29.29.29",
-      "dns.alidns.com": "223.5.5.5",
-      "geosite:category-ads-all": "127.0.0.1"
-    },
-    "servers": [
-      {
-        "address": "https://dns.google/dns-query",
-        "domains": ["geosite:geolocation-!cn"],
-        "expectIPs": ["geoip:!cn"]
-      },
-      "8.8.8.8",
-      {
-        "address": "114.114.114.114",
-        "port": 53,
-        "domains": ["geosite:cn", "geosite:category-games@cn"],
-        "expectIPs": ["geoip:cn"],
-        "skipFallback": true
-      },
-      {
-        "address": "localhost",
-        "skipFallback": true
-      }
-    ]
-  }
+  ]
 }
 EOF
 
@@ -527,6 +234,12 @@ setup_firewall_fail2ban_bbr() {
     ufw allow 22/tcp
     ufw allow 80/tcp
     ufw allow 443/tcp
+    ufw allow 3128/tcp
+    ufw allow 8080/tcp
+
+    echo "y" | ufw enable
+
+    systemctl enable fail2ban
     systemctl restart fail2ban
 
     # Aktifkan BBR
@@ -620,7 +333,7 @@ add_xray_user() {
         if jq empty "$temp_config"; then
             mv "$temp_config" "$config_file"
             echo "$email;$protocol_name;$creds_for_db;$quota_gb;$ip_limit;$exp_date" >> /etc/regarstore/users.db
-            echo -e "${GREEN}User     $email berhasil ditambahkan. Restart Xray...${NC}"
+            echo -e "${GREEN}User      $email berhasil ditambahkan. Restart Xray...${NC}"
             if systemctl restart xray; then
                 echo "UUID/Password: $creds_for_db"
             else
@@ -644,7 +357,7 @@ show_xray_share_links() {
     while IFS=';' read -r email protocol creds quota_gb ip_limit exp_date; do
         [[ "$email" == \#* || -z "$email" ]] && continue
 
-        echo -e "\n${YELLOW}:User                  ${email}${NC}"
+        echo -e "\n${YELLOW}:User                   ${email}${NC}"
         case $protocol in
             vless)
                 path_encoded="%252fvless"
@@ -741,10 +454,3 @@ main() {
 }
 
 main
-    ufw allow 3128/tcp
-    ufw allow 8080/tcp
-
-    echo "y" | ufw enable
-
-    systemctl enable fail2ban
-    
