@@ -2,8 +2,8 @@
 set -e
 
 # =================================================================================
-# Script Name   : VPN Tunnel Premium Installer (No OpenVPN, SSH, Stunnel)
-# Description   : Setup VPN server with XRAY, Squid, Badvpn, firewall, user menu.
+# Script Name   : VPN Tunnel Premium Installer (No OpenVPN, SSH, Stunnel, No Badvpn/Squid)
+# Description   : Setup VPN server with XRAY, firewall, user menu.
 # Author        : Jules for Regar Store (modified)
 # =================================================================================
 
@@ -36,7 +36,7 @@ install_dependencies() {
         ufw fail2ban \
         unzip zip \
         python3 python3-pip \
-        squid haveged certbot acl jq dnsutils git cmake
+        haveged certbot acl jq dnsutils git
 
     info "Installing Python WebSocket proxy..."
     pip3 install proxy.py >/dev/null 2>&1
@@ -103,8 +103,8 @@ setup_xray() {
   "policy": {
     "levels": {
       "0": {
-        "statsUser  Uplink": true,
-        "statsUser  Downlink": true
+        "statsUser    Uplink": true,
+        "statsUser    Downlink": true
       }
     },
     "system": {
@@ -186,68 +186,6 @@ EOF
     info "XRAY setup completed."
 }
 
-setup_support_services() {
-    info "Setting up Squid Proxy and Badvpn..."
-
-    # Configure Squid Proxy
-    info "Configuring Squid Proxy on ports 3128 & 8080..."
-    if [ -f /etc/squid/squid.conf ]; then
-        sed -i 's/http_access deny all/http_access allow all/' /etc/squid/squid.conf
-        sed -i 's/http_access allow localhost/#http_access allow localhost/' /etc/squid/squid.conf
-        grep -q -F "http_port 8080" /etc/squid/squid.conf || echo "http_port 8080" >> /etc/squid/squid.conf
-        grep -q -F "http_port 3128" /etc/squid/squid.conf || echo "http_port 3128" >> /etc/squid/squid.conf
-        DOMAIN=$(cat /root/domain.txt)
-        sed -i "s/# visible_hostname .*/visible_hostname $DOMAIN/" /etc/squid/squid.conf
-
-        systemctl enable squid >/dev/null 2>&1
-        systemctl restart squid
-    else
-        warn "Squid configuration file not found. Skipping."
-    fi
-
-    # Compile and install Badvpn UDP Gateway
-    info "Compiling and installing Badvpn UDP Gateway..."
-    cd /root
-    if [ ! -d badvpn ]; then
-        git clone https://github.com/ambrop72/badvpn.git >/dev/null 2>&1
-    fi
-    mkdir -p /root/badvpn/build
-    cd /root/badvpn/build
-    cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 >/dev/null 2>&1
-    make >/dev/null 2>&1
-
-    if [ -f /root/badvpn/build/udpgw/badvpn-udpgw ]; then
-        mv /root/badvpn/build/udpgw/badvpn-udpgw /usr/local/bin/
-    else
-        error "Badvpn compilation failed."
-    fi
-    cd /root
-    rm -rf /root/badvpn
-
-    cat > /etc/systemd/system/badvpn@.service << EOF
-[Unit]
-Description=Badvpn UDP Gateway for Port %i
-After=network.target
-
-[Service]
-ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr 127.0.0.1:%i --max-clients 512
-Restart=always
-User =nobody
-Group=nogroup
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-    for port in 7100 7200 7300; do
-        systemctl enable badvpn@${port} >/dev/null 2>&1
-        systemctl start badvpn@${port}
-    done
-
-    info "Support services setup completed."
-}
-
 setup_security() {
     info "Setting up Firewall, Fail2Ban, and BBR..."
 
@@ -256,8 +194,6 @@ setup_security() {
 
     ufw allow 80/tcp      # XRAY Non-TLS
     ufw allow 443/tcp     # XRAY TLS
-    ufw allow 3128/tcp    # Squid
-    ufw allow 8080/tcp    # Squid
 
     yes | ufw enable
 
@@ -337,15 +273,11 @@ function add_user() {
     esac
 
     tmpfile=$(mktemp)
-    jq ".inbounds[] | select(.tag==\"$inbound\").settings.clients += [$client]" /usr/local/etc/xray/config.json > "$tmpfile" && \
-    jq ".inbounds" /usr/local/etc/xray/config.json > /dev/null 2>&1
-
-    # Update config.json clients array
     jq "(.inbounds[] | select(.tag==\"$inbound\").settings.clients) += [$client]" /usr/local/etc/xray/config.json > "$tmpfile" && mv "$tmpfile" /usr/local/etc/xray/config.json
 
     echo "$email;$proto;$id;$quota;$ip_limit;$exp_date" >> "$USER_DB"
     systemctl restart xray
-    echo -e "${GREEN}User  $email ditambahkan.${NC}"
+    echo -e "${GREEN}User   $email ditambahkan.${NC}"
     echo "ID/Password: $id"
 }
 
@@ -355,6 +287,7 @@ function list_users() {
     echo "-------------------------------------------------------------"
     while IFS=';' read -r email proto id quota ip_limit exp; do
         [[ "$email" =~ ^#.*$ ]] && continue
+        [[ -z "$email" ]] && continue
         printf "%-25s %-8s %-8s %-8s %-12s\n" "$email" "$proto" "$quota" "$ip_limit" "$exp"
     done < "$USER_DB"
 }
@@ -362,7 +295,7 @@ function list_users() {
 function del_user() {
     read -rp "Username (email) to delete: " email
     if ! grep -q "^$email;" "$USER_DB"; then
-        echo -e "${RED}User  tidak ditemukan.${NC}"
+        echo -e "${RED}User   tidak ditemukan.${NC}"
         return
     fi
     proto=$(grep "^$email;" "$USER_DB" | cut -d';' -f2)
@@ -371,33 +304,200 @@ function del_user() {
     jq "del(.inbounds[] | select(.tag==\"$inbound\").settings.clients[] | select(.email==\"$email\"))" /usr/local/etc/xray/config.json > "$tmpfile" && mv "$tmpfile" /usr/local/etc/xray/config.json
     sed -i "/^$email;/d" "$USER_DB"
     systemctl restart xray
-    echo -e "${GREEN}User  $email dihapus.${NC}"
+    echo -e "${GREEN}User   $email dihapus.${NC}"
+}
+
+function show_share_links() {
+    echo "=== XRAY Share Links ==="
+    DOMAIN=$(cat /root/domain.txt)
+    while IFS=';' read -r email proto id quota ip_limit exp; do
+        [[ "$email" =~ ^#.*$ ]] && continue
+        [[ -z "$email" ]] && continue
+        case $proto in
+            vless)
+                echo "VLESS: vless://${id}@${DOMAIN}:443?path=/vless&security=tls&encryption=none&type=ws#${email}"
+                ;;
+            vmess)
+                config=$(jq -n --arg id "$id" --arg domain "$DOMAIN" --arg email "$email" '{
+                    v: "2",
+                    ps: $email,
+                    add: $domain,
+                    port: "80",
+                    id: $id,
+                    aid: "0",
+                    net: "ws",
+                    type: "none",
+                    host: "",
+                    path: "/vmess",
+                    tls: ""
+                }')
+                echo "VMess: vmess://$(echo $config | base64 -w0)"
+                ;;
+            trojan)
+                echo "Trojan: trojan://${id}@${DOMAIN}:8083?path=/trojan#${email}"
+                ;;
+        esac
+    done < "$USER_DB"
+}
+
+function check_service_status() {
+    echo "=== Service Status ==="
+    systemctl status xray --no-pager
+    systemctl status ufw --no-pager
+    systemctl status fail2ban --no-pager
+}
+
+function renew_ssl() {
+    DOMAIN=$(cat /root/domain.txt)
+    info "Renewing SSL certificate for $DOMAIN..."
+    systemctl stop xray
+    if certbot renew --quiet --deploy-hook "systemctl restart xray"; then
+        info "SSL certificate renewed successfully."
+    else
+        warn "SSL certificate renewal failed."
+    fi
+    systemctl start xray
+}
+
+function reboot_server() {
+    echo "Rebooting server..."
+    sleep 3
+    reboot
 }
 
 function show_menu() {
     clear
-    echo "=== Regar Store VPN Menu ==="
-    echo "1) Tambah User XRAY"
-    echo "2) Hapus User XRAY"
-    echo "3) List User XRAY"
-    echo "4) Keluar"
+    echo "========================================"
+    echo -e "    ${YELLOW}REGAR STORE - VPN SERVER MENU${NC}"
+    echo "========================================"
+    echo " 1. Add XRAY User (VLESS/VMess/Trojan)"
+    echo " 2. Delete XRAY User"
+    echo " 3. List XRAY Users"
+    echo " 4. Show XRAY Share Links"
+    echo " 5. Check Service Status"
+    echo " 6. Renew SSL Certificate"
+    echo " 7. Reboot Server"
+    echo "----------------------------------------"
 }
 
 while true; do
     show_menu
-    read -rp "Pilih opsi [1-4]: " opt
+    read -rp "Pilih opsi [1-7]: " opt
     case $opt in
         1) add_user; press_enter ;;
         2) del_user; press_enter ;;
         3) list_users; press_enter ;;
-        4) exit 0 ;;
+        4) show_share_links; press_enter ;;
+        5) check_service_status; press_enter ;;
+        6) renew_ssl; press_enter ;;
+        7) reboot_server ;;
         *) echo "Opsi tidak valid." ;;
     esac
 done
+
+setup_security() {
+    info "Setting up Firewall, Fail2Ban, and BBR..."
+
+    ufw default deny incoming >/dev/null 2>&1
+    ufw default allow outgoing >/dev/null 2>&1
+
+    ufw allow 80/tcp      # XRAY Non-TLS
+    ufw allow 443/tcp     # XRAY TLS
+
+    yes | ufw enable
+
+    systemctl enable fail2ban >/dev/null 2>&1
+    systemctl restart fail2ban
+
+    if ! grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf; then
+        echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+    fi
+    if ! grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf; then
+        echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+    fi
+
+    sysctl -p >/dev/null 2>&1
+
+    if sysctl net.ipv4.tcp_congestion_control | grep -q "bbr"; then
+        info "TCP BBR enabled successfully."
+    else
+        warn "TCP BBR could not be enabled."
+    fi
+
+    info "Security and performance enhancements completed."
+}
+
+create_vpn_monitor() {
+    cat > /usr/local/bin/vpn-monitor << 'EOF'
+#!/bin/bash
+USER_DB="/etc/regarstore/users.db"
+XRAY_API_ADDR="127.0.0.1:10085"
+XRAY_BIN="/usr/local/bin/xray"
+LOG_FILE="/var/log/vpn-monitor.log"
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
+}
+
+remove_user() {
+    local email="$1"
+    local proto="$2"
+    local inbound="${proto}-in"
+
+    log "Removing user $email due to quota or expiration."
+
+    # Hapus user dari config XRAY via API
+    $XRAY_BIN api inbound remove --server=$XRAY_API_ADDR --tag="$inbound" --email="$email" >/dev/null 2>&1
+
+    # Hapus dari database lokal
+    sed -i "/^$email;/d" "$USER_DB"
+    log "User   $email removed."
+}
+
+check_users() {
+    if [ ! -f "$USER_DB" ]; then
+        log "User   database not found."
+        exit 1
+    fi
+
+    current_date_s=$(date +%s)
+
+    while IFS=';' read -r email proto id quota ip_limit exp_date; do
+        [[ "$email" =~ ^#.*$ ]] && continue
+        [[ -z "$email" ]] && continue
+
+        exp_date_s=$(date -d "$exp_date" +%s)
+        if (( current_date_s > exp_date_s )); then
+            remove_user "$email" "$proto"
+            continue
+        fi
+
+        if (( quota > 0 )); then
+            uplink=$($XRAY_BIN api stats --server=$XRAY_API_ADDR --query "user>>>$email>>>traffic>>>uplink" --reset 2>/dev/null || echo 0)
+            downlink=$($XRAY_BIN api stats --server=$XRAY_API_ADDR --query "user>>>$downlink" --reset 2>/dev/null || echo 0)
+
+            usage_file="/etc/regarstore/usage/${email}.usage"
+            mkdir -p /etc/regarstore/usage
+            prev_usage=$(cat "$usage_file" 2>/dev/null || echo 0)
+            total_usage=$((prev_usage + uplink + downlink))
+            echo "$total_usage" > "$usage_file"
+
+            quota_bytes=$((quota * 1024 * 1024 * 1024))
+            if (( total_usage > quota_bytes )); then
+                remove_user "$email" "$proto"
+                rm -f "$usage_file"
+            fi
+        fi
+    done < "$USER_DB"
+}
+
+log "VPN monitor started."
+check_users
+log "VPN monitor finished."
 EOF
 
-    chmod +x /usr/local/bin/menu
-    info "Menu manajemen dibuat. Jalankan dengan perintah 'menu'."
+    chmod +x /usr/local/bin/vpn-monitor
+    info "VPN monitor script created at /usr/local/bin/vpn-monitor"
 }
 
 finalize_installation() {
@@ -432,85 +532,12 @@ EOF
     info "Instalasi selesai! Silakan reboot server Anda."
 }
 
-create_vpn_monitor() {
-    cat > /usr/local/bin/vpn-monitor << 'EOF'
-#!/bin/bash
-USER_DB="/etc/regarstore/users.db"
-XRAY_API_ADDR="127.0.0.1:10085"
-XRAY_BIN="/usr/local/bin/xray"
-LOG_FILE="/var/log/vpn-monitor.log"
-
-log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
-}
-
-remove_user() {
-    local email="$1"
-    local proto="$2"
-    local inbound="${proto}-in"
-
-    log "Removing user $email due to quota or expiration."
-    # Hapus user dari config XRAY via API
-    $XRAY_BIN api inbound remove --server=$XRAY_API_ADDR --tag="$inbound" --email="$email" >/dev/null 2>&1
-
-    # Hapus dari database lokal
-    sed -i "/^$email;/d" "$USER_DB"
-    log "User  $email removed."
-}
-
-check_users() {
-    if [ ! -f "$USER_DB" ]; then
-        log "User  database not found."
-        exit 1
-    fi
-
-    current_date_s=$(date +%s)
-
-    while IFS=';' read -r email proto id quota ip_limit exp_date; do
-        [[ "$email" =~ ^#.*$ ]] && continue
-        [[ -z "$email" ]] && continue
-
-        exp_date_s=$(date -d "$exp_date" +%s)
-        if (( current_date_s > exp_date_s )); then
-            remove_user "$email" "$proto"
-            continue
-        fi
-
-        if (( quota > 0 )); then
-            uplink=$($XRAY_BIN api stats --server=$XRAY_API_ADDR --query "user>>>$email>>>traffic>>>uplink" --reset 2>/dev/null || echo 0)
-            downlink=$($XRAY_BIN api stats --server=$XRAY_API_ADDR --query "user>>>$email>>>traffic>>>downlink" --reset 2>/dev/null || echo 0)
-
-            usage_file="/etc/regarstore/usage/${email}.usage"
-            mkdir -p /etc/regarstore/usage
-            prev_usage=$(cat "$usage_file" 2>/dev/null || echo 0)
-            total_usage=$((prev_usage + uplink + downlink))
-            echo "$total_usage" > "$usage_file"
-
-            quota_bytes=$((quota * 1024 * 1024 * 1024))
-            if (( total_usage > quota_bytes )); then
-                remove_user "$email" "$proto"
-                rm -f "$usage_file"
-            fi
-        fi
-    done < "$USER_DB"
-}
-
-log "VPN monitor started."
-check_users
-log "VPN monitor finished."
-EOF
-
-    chmod +x /usr/local/bin/vpn-monitor
-    info "VPN monitor script created at /usr/local/bin/vpn-monitor"
-}
-
 main() {
     check_root
     warn "Pastikan domain Anda sudah di-pointing ke IP Address VPS ini."
     ask_domain
     install_dependencies
     setup_xray
-    setup_support_services
     setup_security
     setup_management_menu
     create_vpn_monitor
