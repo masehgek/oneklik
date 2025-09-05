@@ -1,13 +1,6 @@
 #!/bin/bash
 set -e
 
-# =================================================================================
-# Script Name   : VPN Tunnel Premium Installer
-# Description   : Automates the setup of a complete VPN server.
-# Author        : Jules for Regar Store
-# OS            : Ubuntu 20.04 & 22.04
-# =================================================================================
-
 # --- Color Codes ---
 GREEN='\033[0;32m'
 RED='\033[0;31m'
@@ -36,14 +29,6 @@ check_root() {
     if [[ "${EUID}" -ne 0 ]]; then
         error "This script must be run as root. Please use 'sudo -i' or 'sudo su'."
     fi
-}
-
-check_os() {
-    source /etc/os-release
-    if [[ "${ID}" != "ubuntu" || "${VERSION_ID}" != "22.04" ]]; then
-        error "This script requires Ubuntu 22.04. Your version is ${VERSION_ID}."
-    fi
-    info "Operating system check passed."
 }
 
 # --- Feature Installation Functions (to be implemented) ---
@@ -140,7 +125,7 @@ EOF
 Description=SSH Over WebSocket HTTP
 After=network.target nss-lookup.target
 [Service]
-User=root
+User =root
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
@@ -154,7 +139,7 @@ EOF
 Description=SSH Over WebSocket ALT
 After=network.target nss-lookup.target
 [Service]
-User=root
+User =root
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
@@ -286,8 +271,8 @@ setup_xray() {
   "policy": {
     "levels": {
       "0": {
-        "statsUserUplink": true,
-        "statsUserDownlink": true
+        "statsUser Uplink": true,
+        "statsUser Downlink": true
       }
     },
     "system": {
@@ -384,7 +369,7 @@ EOF
     # --- Update Stunnel to not use port 443 ---
     info "Updating Stunnel to free up port 443 for XRAY..."
     # Remove the old openvpn_ssl section on port 443
-    sed -i '/\[openvpn_ssl\]/,+2d' /etc/stunnel/stunnel.conf
+    sed -i '/\$openvpn_ssl\$/,+2d' /etc/stunnel/stunnel.conf
     # Add a new one on a non-conflicting port
     cat >> /etc/stunnel/stunnel.conf << EOF
 
@@ -428,7 +413,7 @@ setup_support_services() {
         info "Installing git..."
         apt-get install -y git >/dev/null 2>&1
     fi
-    if ! command -v cmake &> /dev/null; then
+        if ! command -v cmake &> /dev/null; then
         info "Installing cmake..."
         apt-get install -y cmake >/dev/null 2>&1
     fi
@@ -612,7 +597,7 @@ add_xray_user() {
 
     if [[ $? -eq 0 ]]; then
         echo "$email;$protocol_name;$creds_for_db;$quota_gb;$ip_limit;$exp_date" >> "$USER_DB"
-        echo -e "${GREEN}User '$email' for $protocol_name added. Restarting XRAY...${NC}"
+        echo -e "${GREEN}User  '$email' for $protocol_name added. Restarting XRAY...${NC}"
         systemctl restart xray
         echo "UUID/Password: $creds_for_db"
     else
@@ -624,7 +609,7 @@ delete_xray_user() {
     read -p "Enter username (email) to delete: " email
     user_line=$(grep "^$email;" "$USER_DB")
     if [[ -z "$user_line" ]]; then
-        echo -e "${RED}User '$email' not found in database.${NC}"; return
+        echo -e "${RED}User  '$email' not found in database.${NC}"; return
     fi
 
     protocol_name=$(echo "$user_line" | cut -d';' -f2)
@@ -637,7 +622,7 @@ delete_xray_user() {
 
     if [[ $? -eq 0 ]]; then
         sed -i "/^$email;/d" "$USER_DB"
-        echo -e "${GREEN}User '$email' removed. Restarting XRAY...${NC}"
+        echo -e "${GREEN}User  '$email' removed. Restarting XRAY...${NC}"
         systemctl restart xray
     else
         echo -e "${RED}Failed to modify xray config file.${NC}"
@@ -661,7 +646,7 @@ show_xray_share_links() {
     while IFS=';' read -r email protocol creds quota_gb ip_limit exp_date; do
         if [[ "$email" == \#* || -z "$email" ]]; then continue; fi
 
-        echo -e "\n${YELLOW}User: ${email}${NC}"
+        echo -e "\n${YELLOW}:User  ${email}${NC}"
         case $protocol in
             vless)
                 link="vless://${creds}@${DOMAIN}:443?type=ws&path=%2Fvless&security=tls#${email}"
@@ -697,9 +682,9 @@ manage_ssh_users() {
         2) read -p "Enter username to delete: " username
            if id "$username" &>/dev/null; then
                userdel -r "$username"
-               echo -e "${GREEN}User '$username' deleted.${NC}"
+               echo -e "${GREEN}User  '$username' deleted.${NC}"
            else
-               echo -e "${RED}User '$username' does not exist.${NC}"
+               echo -e "${RED}User  '$username' does not exist.${NC}"
            fi
            ;;
         *) echo "Invalid action." ;;
@@ -786,7 +771,7 @@ remove_user() {
 
 check_users() {
     if [ ! -f "$USER_DB" ]; then
-        log "User database not found."
+        log "User  database not found."
         exit 1
     fi
 
@@ -944,11 +929,10 @@ EOF
     echo -e "Ports:                    ${GREEN}3128, 8080${NC}"
 }
 
-
 # --- Main Execution Logic ---
 main() {
     check_root
-    check_os
+    # check_os dihapus agar tidak melakukan pengecekan OS
 
     warn "Pastikan domain Anda sudah di-pointing ke IP Address VPS ini."
     ask_domain
