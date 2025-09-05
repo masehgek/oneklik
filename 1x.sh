@@ -599,6 +599,7 @@ add_xray_user() {
         echo "$email;$protocol_name;$creds_for_db;$quota_gb;$ip_limit;$exp_date" >> "$USER_DB"
         echo -e "${GREEN}User  '$email' for $protocol_name added. Restarting XRAY...${NC}"
         systemctl restart xray
+        chmod 644 /usr/local/etc/xray/config.json
         echo "UUID/Password: $creds_for_db"
     else
         echo -e "${RED}Failed to modify xray config file.${NC}"
@@ -624,6 +625,7 @@ delete_xray_user() {
         sed -i "/^$email;/d" "$USER_DB"
         echo -e "${GREEN}User  '$email' removed. Restarting XRAY...${NC}"
         systemctl restart xray
+        chmod 644 /usr/local/etc/xray/config.json
     else
         echo -e "${RED}Failed to modify xray config file.${NC}"
     fi
