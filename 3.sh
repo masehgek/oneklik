@@ -1,549 +1,816 @@
 #!/bin/bash
-set -e
 
-# =================================================================================
-# Script Name   : VPN Tunnel Premium Installer (No OpenVPN, SSH, Stunnel, No Badvpn/Squid)
-# Description   : Setup VPN server with XRAY, firewall, user menu.
-# Author        : Jules for Regar Store (modified)
-# =================================================================================
+CONFIG_DIR="/etc/xray"
+USER_DB="$CONFIG_DIR/users.json"
+XRAY_CONFIG="$CONFIG_DIR/config.json"
+CONFIG_FILE="$CONFIG_DIR/config.conf"
+NGINX_SITES_AVAILABLE="/etc/nginx/sites-available"
+NGINX_SITES_ENABLED="/etc/nginx/sites-enabled"
+BOT_SCRIPT="$CONFIG_DIR/bot.py"
+MAIN_SCRIPT_PATH=$(readlink -f "$0")
 
-GREEN='\033[0;32m'
-RED='\033[0;31m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
-
-DOMAIN=""
-
-info() { echo -e "${GREEN}[INFO]${NC} $1"; }
-warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
-error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
-
-check_root() {
-    if [[ "${EUID}" -ne 0 ]]; then
-        error "This script must be run as root."
-    fi
+function info() {
+    echo "[*] $1"
 }
 
-install_dependencies() {
-    info "Updating package lists..."
-    apt-get update -y >/dev/null 2>&1
-
-    info "Installing base dependencies..."
-    apt-get install -y \
-        wget curl socat htop cron \
-        build-essential libnss3-dev \
-        zlib1g-dev libssl-dev libgmp-dev \
-        ufw fail2ban \
-        unzip zip \
-        python3 python3-pip \
-        haveged certbot acl jq dnsutils git
-
-    info "Installing Python WebSocket proxy..."
-    pip3 install proxy.py >/dev/null 2>&1
-    info "Base dependencies installed."
+function error() {
+    echo "ERROR: $1"
+    exit 1
 }
 
-ask_domain() {
-    info "Untuk sertifikat SSL, Anda memerlukan sebuah domain."
-    read -rp "Silakan masukkan nama domain Anda (contoh: mydomain.com): " DOMAIN
-    if [ -z "$DOMAIN" ]; then
-        error "Domain tidak boleh kosong."
-    fi
-    info "Domain Anda akan diatur ke: $DOMAIN"
-    echo "$DOMAIN" > /root/domain.txt
+function pause() {
+  read -p "Tekan Enter untuk melanjutkan..."
 }
 
-setup_xray() {
-    info "Setting up XRAY (Vmess/Vless/Trojan)..."
-    DOMAIN=$(cat /root/domain.txt)
+function load_config() {
+  if [ -f "$CONFIG_FILE" ]; then
+    source "$CONFIG_FILE"
+  fi
+}
 
-    info "Installing XRAY core..."
-    bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install --without-geodata >/dev/null 2>&1
+function save_config() {
+  cat > "$CONFIG_FILE" <<EOF
+DOMAIN="$DOMAIN"
+EMAIL="$EMAIL"
+EOF
+}
 
-    info "Performing DNS pre-flight check for $DOMAIN..."
-    local_ip=$(curl -s ifconfig.me)
-    resolved_ip=$(dig +short "$DOMAIN" @8.8.8.8)
+function is_installed() {
+  if command -v xray >/dev/null 2>&1; then
+    echo "Xray: Terinstall"
+  else
+    echo "Xray: Belum terinstall"
+  fi
 
-    if [[ "$local_ip" != "$resolved_ip" ]]; then
-        error "DNS validation failed. Domain '$DOMAIN' points to '$resolved_ip', VPS IP is '$local_ip'."
+  if command -v nginx >/dev/null 2>&1; then
+    echo "Nginx: Terinstall"
+  else
+    echo "Nginx: Belum terinstall"
+  fi
+}
+
+function is_running() {
+  if systemctl is-active --quiet xray; then
+    echo "Xray service: Berjalan"
+  else
+    echo "Xray service: Tidak berjalan"
+  fi
+
+  if systemctl is-active --quiet nginx; then
+    echo "Nginx service: Berjalan"
+  else
+    echo "Nginx service: Tidak berjalan"
+  fi
+}
+
+function install_dependencies() {
+  info "Update dan install dependencies..."
+  apt update && apt upgrade -y
+  apt install -y curl wget unzip jq nginx iptables-persistent socat certbot python3-certbot-nginx python3-pip
+}
+
+function install_xray() {
+  info "Mengunduh dan memasang Xray core..."
+  bash <(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh) install
+  mkdir -p "$CONFIG_DIR"
+  if [ ! -f "$USER_DB" ]; then
+    echo '{"users":[]}' > "$USER_DB"
+  fi
+}
+
+function check_dns() {
+  info "Mengecek DNS domain $DOMAIN..."
+  local_ip=$(curl -s https://ipinfo.io/ip)
+  resolved_ip=$(dig +short "$DOMAIN" @8.8.8.8)
+
+  if [[ "$local_ip" != "$resolved_ip" ]]; then
+      error "DNS validation failed. Domain '$DOMAIN' points to '$resolved_ip', but this VPS IP is '$local_ip'. Please check your DNS records."
+  fi
+  info "DNS domain sudah benar mengarah ke IP server."
+}
+
+function setup_certbot_standalone() {
+  info "Menghentikan layanan yang menggunakan port 80..."
+  systemctl stop nginx 2>/dev/null
+
+  info "Membuka port 80 untuk validasi certbot..."
+  ufw allow 80/tcp 2>/dev/null
+
+  info "Memperoleh sertifikat SSL menggunakan Certbot --standalone..."
+  if ! certbot certonly --standalone -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL" --preferred-challenges http; then
+      error "Gagal mendapatkan sertifikat SSL dari Let's Encrypt. Pastikan domain Anda sudah di-pointing ke IP VPS ini."
+  fi
+
+  info "Menutup kembali port 80..."
+  ufw deny 80/tcp 2>/dev/null
+
+  info "Sertifikat SSL berhasil diperoleh."
+}
+
+function remove_default_nginx_conf() {
+  if [ -f "/etc/nginx/sites-enabled/default" ]; then
+    info "Menonaktifkan konfigurasi default nginx untuk menghindari konflik..."
+    rm -f /etc/nginx/sites-enabled/default
+    systemctl reload nginx
+  fi
+}
+
+function setup_nginx() {
+  info "Mengkonfigurasi Nginx sebagai reverse proxy..."
+  remove_default_nginx_conf
+  local conf_path="$NGINX_SITES_AVAILABLE/$DOMAIN"
+  
+  # Cari direktori sertifikat terbaru
+  CERT_PATH="/etc/letsencrypt/live/$DOMAIN"
+  if [ ! -d "$CERT_PATH" ]; then
+    CERT_PATH=$(find /etc/letsencrypt/live/ -maxdepth 1 -type d -name "$DOMAIN-*" | sort -V | tail -n 1)
+    if [ -z "$CERT_PATH" ]; then
+      error "Tidak dapat menemukan direktori sertifikat Certbot."
     fi
-    info "DNS check passed."
+  fi
 
-    info "Obtaining SSL certificate for $DOMAIN..."
-    ufw allow 80/tcp
-    systemctl stop xray >/dev/null 2>&1 || true
-    if ! certbot certonly --standalone -d "$DOMAIN" --non-interactive --agree-tos -m "admin@$DOMAIN" --preferred-challenges http; then
-        error "Failed to obtain SSL certificate."
-    fi
-    ufw deny 80/tcp
-    systemctl start xray
-
-    info "SSL certificate obtained."
-
-    VLESS_UUID=$(xray uuid)
-    VMESS_UUID=$(xray uuid)
-    TROJAN_PASSWORD=$(openssl rand -base64 16)
-
-    echo "VLESS_UUID=${VLESS_UUID}" > /root/xray_credentials.txt
-    echo "VMESS_UUID=${VMESS_UUID}" >> /root/xray_credentials.txt
-    echo "TROJAN_PASSWORD=${TROJAN_PASSWORD}" >> /root/xray_credentials.txt
-
-    cat > /usr/local/etc/xray/config.json << EOF
-{
-  "log": { "loglevel": "warning" },
-  "stats": {},
-  "api": {
-    "tag": "api",
-    "services": [
-      "HandlerService",
-      "LoggerService",
-      "StatsService"
-    ]
-  },
-  "policy": {
-    "levels": {
-      "0": {
-        "statsUser    Uplink": true,
-        "statsUser    Downlink": true
-      }
-    },
-    "system": {
-      "statsInboundUplink": true,
-      "statsInboundDownlink": true
+  cat > "$conf_path" <<EOF
+server {
+    listen 80;
+    server_name $DOMAIN;
+    location / {
+        return 301 https://\$host\$request_uri;
     }
+}
+server {
+    listen 443 ssl http2;
+    server_name $DOMAIN;
+    ssl_certificate $CERT_PATH/fullchain.pem;
+    ssl_certificate_key $CERT_PATH/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers on;
+
+    # Konfigurasi untuk WebSocket
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    }
+    location /vless-ws {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    }
+    location /vmess-ws {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    }
+    location /trojan-ws {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    }
+
+    # Konfigurasi untuk gRPC
+    location /vless-grpc {
+        grpc_pass grpc://127.0.0.1:8080;
+    }
+    location /vmess-grpc {
+        grpc_pass grpc://127.0.0.1:8080;
+    }
+    location /trojan-grpc {
+        grpc_pass grpc://127.0.0.1:8080;
+    }
+}
+EOF
+  ln -sf "$conf_path" "$NGINX_SITES_ENABLED/$DOMAIN"
+  nginx -t
+  if [ $? -ne 0 ]; then
+    error "Error konfigurasi nginx, silakan cek manual."
+  fi
+  systemctl start nginx
+  systemctl reload nginx
+  info "Nginx reverse proxy sudah dikonfigurasi dan direload."
+}
+
+function set_xray_config_path() {
+  info "Mengubah jalur konfigurasi Xray ke /etc/xray/config.json..."
+  XRAY_SERVICE_FILE="/etc/systemd/system/xray.service"
+  
+  if [ ! -f "$XRAY_SERVICE_FILE" ]; then
+    error "File layanan Xray tidak ditemukan: $XRAY_SERVICE_FILE"
+  fi
+  
+  # Hapus file drop-in yang mengganggu
+  if [ -f "/etc/systemd/system/xray.service.d/10-donot_touch_single_conf.conf" ]; then
+    info "Menghapus file drop-in yang mengganggu jalur konfigurasi..."
+    rm /etc/systemd/system/xray.service.d/10-donot_touch_single_conf.conf
+  fi
+
+  # Menggunakan sed untuk mengubah jalur konfigurasi
+  sed -i 's|ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json|ExecStart=/usr/local/bin/xray run -config /etc/xray/config.json|g' "$XRAY_SERVICE_FILE"
+
+  systemctl daemon-reload
+  info "Jalur konfigurasi Xray berhasil diubah."
+}
+
+function generate_xray_config() {
+  info "Membuat konfigurasi Xray multi-protokol (WS & gRPC)..."
+  local users_json
+  users_json=$(cat "$USER_DB")
+  local vless_clients vmess_clients trojan_clients
+  
+  vless_clients=$(echo "$users_json" | jq '[.users[] | {id: .id, email: .username}]')
+  vmess_clients=$(echo "$users_json" | jq '[.users[] | {id: .id, alterId: 0, email: .username}]')
+  trojan_clients=$(echo "$users_json" | jq '[.users[] | {password: .id, email: .username}]')
+
+  cat > "$XRAY_CONFIG" <<EOF
+{
+  "log": {
+    "loglevel": "warning"
   },
   "inbounds": [
     {
-      "tag": "api-in",
-      "listen": "127.0.0.1",
-      "port": 10085,
-      "protocol": "dokodemo-door",
-      "settings": { "address": "127.0.0.1" }
-    },
-    {
-      "port": 443,
+      "port": 8080,
       "protocol": "vless",
-      "tag": "vless-in",
       "settings": {
-        "clients": [ { "id": "${VLESS_UUID}", "level": 0, "email": "user@${DOMAIN}" } ],
+        "clients": $vless_clients,
         "decryption": "none"
       },
       "streamSettings": {
         "network": "ws",
-        "security": "tls",
-        "tlsSettings": {
-          "alpn": ["http/1.1"],
-          "certificates": [
-            {
-              "certificateFile": "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem",
-              "keyFile": "/etc/letsencrypt/live/${DOMAIN}/privkey.pem"
-            }
-          ]
-        },
-        "wsSettings": { "path": "/vless" }
+        "wsSettings": {
+          "path": "/vless-ws"
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls"]
       }
     },
     {
-      "port": 80,
+      "port": 8080,
       "protocol": "vmess",
-      "tag": "vmess-in",
-      "settings": { "clients": [ { "id": "${VMESS_UUID}", "alterId": 0, "email": "user@${DOMAIN}" } ] },
-      "streamSettings": { "network": "ws", "security": "none", "wsSettings": { "path": "/vmess" } }
+      "settings": {
+        "clients": $vmess_clients
+      },
+      "streamSettings": {
+        "network": "ws",
+        "wsSettings": {
+          "path": "/vmess-ws"
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls"]
+      }
     },
     {
-      "port": 8083,
+      "port": 8080,
       "protocol": "trojan",
-      "tag": "trojan-in",
-      "settings": { "clients": [ { "password": "${TROJAN_PASSWORD}", "email": "user@${DOMAIN}" } ] },
-      "streamSettings": { "network": "ws", "security": "none", "wsSettings": { "path": "/trojan" } }
+      "settings": {
+        "clients": $trojan_clients
+      },
+      "streamSettings": {
+        "network": "ws",
+        "wsSettings": {
+          "path": "/trojan-ws"
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls"]
+      }
+    },
+    {
+      "port": 8080,
+      "protocol": "vless",
+      "settings": {
+        "clients": $vless_clients,
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "grpc",
+        "grpcSettings": {
+          "serviceName": "vless-grpc"
+        },
+        "tlsSettings": {
+          "allowInsecure": false,
+          "serverName": "$DOMAIN"
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls"]
+      }
+    },
+    {
+      "port": 8080,
+      "protocol": "vmess",
+      "settings": {
+        "clients": $vmess_clients
+      },
+      "streamSettings": {
+        "network": "grpc",
+        "grpcSettings": {
+          "serviceName": "vmess-grpc"
+        },
+        "tlsSettings": {
+          "allowInsecure": false,
+          "serverName": "$DOMAIN"
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls"]
+      }
+    },
+    {
+      "port": 8080,
+      "protocol": "trojan",
+      "settings": {
+        "clients": $trojan_clients
+      },
+      "streamSettings": {
+        "network": "grpc",
+        "grpcSettings": {
+          "serviceName": "trojan-grpc"
+        },
+        "tlsSettings": {
+          "allowInsecure": false,
+          "serverName": "$DOMAIN"
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls"]
+      }
     }
   ],
   "outbounds": [
-    { "protocol": "freedom", "settings": {} },
-    { "protocol": "blackhole", "settings": {}, "tag": "blocked" }
-  ],
-  "routing": {
-    "rules": [
-      {
-        "type": "field",
-        "inboundTag": [ "api-in" ],
-        "outboundTag": "api"
-      }
-    ]
-  }
+    {
+      "protocol": "freedom",
+      "settings": {}
+    }
+  ]
 }
 EOF
-
-    chmod 644 /usr/local/etc/xray/config.json
-    systemctl daemon-reload
-    systemctl enable xray >/dev/null 2>&1
-    systemctl restart xray
-
-    if ! systemctl is-active --quiet xray; then
-        error "XRAY service failed to start. Periksa 'journalctl -u xray'."
-    fi
-
-    info "XRAY setup completed."
 }
 
-setup_security() {
-    info "Setting up Firewall, Fail2Ban, and BBR..."
-
-    ufw default deny incoming >/dev/null 2>&1
-    ufw default allow outgoing >/dev/null 2>&1
-
-    ufw allow 80/tcp      # XRAY Non-TLS
-    ufw allow 443/tcp     # XRAY TLS
-
-    yes | ufw enable
-
-    systemctl enable fail2ban >/dev/null 2>&1
-    systemctl restart fail2ban
-
-    if ! grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf; then
-        echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
-    fi
-    if ! grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf; then
-        echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-    fi
-
-    sysctl -p >/dev/null 2>&1
-
-    if sysctl net.ipv4.tcp_congestion_control | grep -q "bbr"; then
-        info "TCP BBR enabled successfully."
-    else
-        warn "TCP BBR could not be enabled."
-    fi
-
-    info "Security and performance enhancements completed."
+function restart_xray() {
+  info "Restart Xray service..."
+  systemctl restart xray
 }
 
-setup_management_menu() {
-    info "Setting up user management menu..."
+function add_user_cmd() {
+  local username=$1
+  local quota=$2
+  local days=$3
+  local ip_limit=0
 
-    mkdir -p /etc/regarstore
-    touch /etc/regarstore/users.db
+  if jq -e --arg u "$username" '.users[] | select(.username == $u)' "$USER_DB" > /dev/null 2>&1; then
+    echo "Username '$username' sudah ada!"
+    return
+  fi
 
-    cat > /usr/local/bin/menu << 'EOF'
+  if [ ! -s "$USER_DB" ]; then
+    echo '{"users":[]}' > "$USER_DB"
+  fi
+
+  uuid=$(cat /proc/sys/kernel/random/uuid)
+  expire_date=$(date -d "+$days days" +"%Y-%m-%d")
+
+  jq --arg u "$username" --arg id "$uuid" --arg q "$quota" --arg ip "$ip_limit" --arg e "$expire_date" \
+    '.users += [{"username":$u,"id":$id,"quota":($q|tonumber),"ip_limit":($ip|tonumber),"expire":$e,"used":0}]' "$USER_DB" > tmp.$$.json && mv tmp.$$.json "$USER_DB"
+
+  echo "User $username berhasil ditambahkan dengan UUID $uuid, expired $expire_date"
+
+  generate_xray_config
+  restart_xray
+}
+
+function remove_user_cmd() {
+  local username=$1
+
+  if ! jq -e --arg u "$username" '.users[] | select(.username == $u)' "$USER_DB" > /dev/null 2>&1; then
+    echo "User '$username' tidak ditemukan."
+    return
+  fi
+
+  tmpfile=$(mktemp)
+  jq --arg u "$username" 'del(.users[] | select(.username == $u))' "$USER_DB" > "$tmpfile" && mv "$tmpfile" "$USER_DB"
+
+  echo "User '$username' berhasil dihapus."
+  
+  generate_xray_config
+  restart_xray
+}
+
+function list_users_cmd() {
+  info "Daftar Pengguna:"
+  jq '.users[]' "$USER_DB"
+}
+
+function remove_expired_users() {
+  info "Menghapus user yang sudah expired..."
+  today=$(date +"%Y-%m-%d")
+  tmpfile=$(mktemp)
+  jq --arg today "$today" '.users |= map(select(.expire >= $today))' "$USER_DB" > "$tmpfile" && mv "$tmpfile" "$USER_DB"
+}
+
+function create_maintenance_script() {
+  cat > "$CONFIG_DIR/maintenance.sh" <<'EOF'
 #!/bin/bash
-GREEN='\033[0;32m'
-RED='\033[0;31m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
+CONFIG_DIR="/etc/xray"
+USER_DB="$CONFIG_DIR/users.json"
 
-USER_DB="/etc/regarstore/users.db"
-XRAY_BIN="/usr/local/bin/xray"
-XRAY_API_ADDR="127.0.0.1:10085"
-
-function press_enter() {
-    echo
-    read -rp "Press Enter to continue..."
+function remove_expired_users() {
+  today=$(date +"%Y-%m-%d")
+  tmpfile=$(mktemp)
+  jq --arg today "$today" '.users |= map(select(.expire >= $today))' "$USER_DB" > "$tmpfile" && mv "$tmpfile" "$USER_DB"
 }
 
-function add_user() {
-    echo "=== Add XRAY User ==="
-    read -rp "Username (email): " email
-    read -rp "Protocol [vless/vmess/trojan]: " proto
-    read -rp "Quota (GB, 0 unlimited): " quota
-    read -rp "IP Limit (0 unlimited): " ip_limit
-    read -rp "Expire days: " days
-
-    exp_date=$(date -d "+$days days" +"%Y-%m-%d")
-
-    case $proto in
-        vless)
-            id=$($XRAY_BIN uuid)
-            client="{\"id\":\"$id\",\"level\":0,\"email\":\"$email\"}"
-            inbound="vless-in"
-            ;;
-        vmess)
-            id=$($XRAY_BIN uuid)
-            client="{\"id\":\"$id\",\"alterId\":0,\"email\":\"$email\"}"
-            inbound="vmess-in"
-            ;;
-        trojan)
-            id=$(openssl rand -base64 12)
-            client="{\"password\":\"$id\",\"email\":\"$email\"}"
-            inbound="trojan-in"
-            ;;
-        *)
-            echo -e "${RED}Protocol tidak valid.${NC}"
-            return
-            ;;
-    esac
-
-    tmpfile=$(mktemp)
-    jq "(.inbounds[] | select(.tag==\"$inbound\").settings.clients) += [$client]" /usr/local/etc/xray/config.json > "$tmpfile" && mv "$tmpfile" /usr/local/etc/xray/config.json
-
-    echo "$email;$proto;$id;$quota;$ip_limit;$exp_date" >> "$USER_DB"
-    systemctl restart xray
-    echo -e "${GREEN}User   $email ditambahkan.${NC}"
-    echo "ID/Password: $id"
+remove_expired_users
+systemctl restart xray
+EOF
+  chmod +x "$CONFIG_DIR/maintenance.sh"
 }
 
-function list_users() {
-    echo "=== Daftar User XRAY ==="
-    printf "%-25s %-8s %-8s %-8s %-12s\n" "Email" "Proto" "Quota" "IP Lim" "Expire"
-    echo "-------------------------------------------------------------"
-    while IFS=';' read -r email proto id quota ip_limit exp; do
-        [[ "$email" =~ ^#.*$ ]] && continue
-        [[ -z "$email" ]] && continue
-        printf "%-25s %-8s %-8s %-8s %-12s\n" "$email" "$proto" "$quota" "$ip_limit" "$exp"
-    done < "$USER_DB"
+function setup_cronjob() {
+  create_maintenance_script
+  croncmd="/bin/bash $CONFIG_DIR/maintenance.sh"
+  cronjob="0 0 * * * $croncmd"
+
+  (crontab -l 2>/dev/null | grep -v -F "$croncmd" ; echo "$cronjob") | crontab -
+  info "Cronjob hapus user expired sudah dibuat (jalan tiap jam 00:00)."
 }
 
-function del_user() {
-    read -rp "Username (email) to delete: " email
-    if ! grep -q "^$email;" "$USER_DB"; then
-        echo -e "${RED}User   tidak ditemukan.${NC}"
+function generate_sharelink() {
+  local username=$1
+  if [ -z "$username" ]; then
+    echo "Masukkan username sebagai argumen."
+    return 1
+  fi
+  
+  user=$(jq -r --arg u "$username" '.users[] | select(.username == $u)' "$USER_DB")
+  if [ -z "$user" ]; then
+    echo "User tidak ditemukan!"
+    return 1
+  fi
+
+  id=$(echo "$user" | jq -r '.id')
+  domain="$DOMAIN"
+  expire=$(echo "$user" | jq -r '.expire')
+  
+  echo "====================================================="
+  echo "        Tautan Berbagi untuk Pengguna: $username     "
+  echo "           Masa Aktif hingga: $expire                "
+  echo "====================================================="
+  echo ""
+  
+  echo "######### VLESS (WS & gRPC) #########"
+  echo "######### WebSocket (WS) #########"
+  vless_ws_link="vless://${id}@${domain}:443?type=ws&security=tls&host=${domain}&path=%2Fvless-ws&sni=${domain}#${username}-WS"
+  echo "$vless_ws_link"
+  echo "######### gRPC #########"
+  vless_grpc_link="vless://${id}@${domain}:443/?security=tls&encryption=none&headerType=gun&type=grpc&flow=none&serviceName=vless-grpc&sni=${domain}#${username}-gRPC"
+  echo "$vless_grpc_link"
+  echo ""
+  
+  echo "######### VMess (WS & gRPC) #########"
+  echo "######### WebSocket (WS) #########"
+  vmess_ws_json=$(jq -n --arg id "$id" --arg domain "$domain" --arg username "$username" '{
+    v: "2",
+    ps: ($username + "-WS"),
+    add: $domain,
+    port: "443",
+    id: $id,
+    aid: "0",
+    net: "ws",
+    type: "none",
+    host: $domain,
+    path: "/vmess-ws",
+    tls: "tls"
+  }')
+  vmess_ws_link="vmess://$(echo -n "$vmess_ws_json" | base64 -w0)"
+  echo "$vmess_ws_link"
+  echo "######### gRPC #########"
+  vmess_grpc_json=$(jq -n --arg id "$id" --arg domain "$domain" --arg username "$username" '{
+    v: "2",
+    ps: ($username + "-gRPC"),
+    add: $domain,
+    port: "443",
+    id: $id,
+    aid: "0",
+    net: "grpc",
+    type: "gun",
+    host: "",
+    path: "vmess-grpc",
+    tls: "tls",
+    sni: $domain
+  }')
+  vmess_grpc_link="vmess://$(echo -n "$vmess_grpc_json" | base64 -w0)"
+  echo "$vmess_grpc_link"
+  echo ""
+  
+  echo "######### Trojan (WS & gRPC) #########"
+  echo "######### WebSocket (WS) #########"
+  trojan_ws_link="trojan://${id}@${domain}:443?security=tls&type=ws&host=${domain}&path=%2Ftrojan-ws&sni=${domain}#${username}-WS"
+  echo "$trojan_ws_link"
+  echo "######### gRPC #########"
+  trojan_grpc_link="trojan://${id}@${domain}:443?security=tls&type=grpc&serviceName=trojan-grpc&serverName=${domain}&headerType=gun&flow=none&sni=${domain}#${username}-gRPC"
+  echo "$trojan_grpc_link"
+  echo ""
+}
+
+function setup_telegram_bot() {
+    read -p "Masukkan Token Bot Telegram: " BOT_TOKEN
+    read -p "Masukkan Chat ID Telegram Anda: " CHAT_ID
+
+    if [[ -z "$BOT_TOKEN" || -z "$CHAT_ID" ]]; then
+        info "Token atau Chat ID kosong. Bot Telegram tidak akan diinstal."
         return
     fi
-    proto=$(grep "^$email;" "$USER_DB" | cut -d';' -f2)
-    inbound="${proto}-in"
-    tmpfile=$(mktemp)
-    jq "del(.inbounds[] | select(.tag==\"$inbound\").settings.clients[] | select(.email==\"$email\"))" /usr/local/etc/xray/config.json > "$tmpfile" && mv "$tmpfile" /usr/local/etc/xray/config.json
-    sed -i "/^$email;/d" "$USER_DB"
-    systemctl restart xray
-    echo -e "${GREEN}User   $email dihapus.${NC}"
-}
 
-function show_share_links() {
-    echo "=== XRAY Share Links ==="
-    DOMAIN=$(cat /root/domain.txt)
-    while IFS=';' read -r email proto id quota ip_limit exp; do
-        [[ "$email" =~ ^#.*$ ]] && continue
-        [[ -z "$email" ]] && continue
-        case $proto in
-            vless)
-                echo "VLESS: vless://${id}@${DOMAIN}:443?path=/vless&security=tls&encryption=none&type=ws#${email}"
-                ;;
-            vmess)
-                config=$(jq -n --arg id "$id" --arg domain "$DOMAIN" --arg email "$email" '{
-                    v: "2",
-                    ps: $email,
-                    add: $domain,
-                    port: "80",
-                    id: $id,
-                    aid: "0",
-                    net: "ws",
-                    type: "none",
-                    host: "",
-                    path: "/vmess",
-                    tls: ""
-                }')
-                echo "VMess: vmess://$(echo $config | base64 -w0)"
-                ;;
-            trojan)
-                echo "Trojan: trojan://${id}@${DOMAIN}:8083?path=/trojan#${email}"
-                ;;
-        esac
-    done < "$USER_DB"
-}
+    info "Menginstal library Python untuk bot Telegram..."
+    pip3 install python-telegram-bot --upgrade
 
-function check_service_status() {
-    echo "=== Service Status ==="
-    systemctl status xray --no-pager
-    systemctl status ufw --no-pager
-    systemctl status fail2ban --no-pager
-}
+    info "Membuat file bot.py..."
+    cat > "$BOT_SCRIPT" <<EOF
+import logging
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
+import subprocess
+import os
 
-function renew_ssl() {
-    DOMAIN=$(cat /root/domain.txt)
-    info "Renewing SSL certificate for $DOMAIN..."
-    systemctl stop xray
-    if certbot renew --quiet --deploy-hook "systemctl restart xray"; then
-        info "SSL certificate renewed successfully."
-    else
-        warn "SSL certificate renewal failed."
-    fi
-    systemctl start xray
-}
+TOKEN = "$BOT_TOKEN"
+ADMIN_CHAT_ID = int("$CHAT_ID")
+SCRIPT_PATH = "$MAIN_SCRIPT_PATH"
 
-function reboot_server() {
-    echo "Rebooting server..."
-    sleep 3
-    reboot
-}
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
 
-function show_menu() {
-    clear
-    echo "========================================"
-    echo -e "    ${YELLOW}REGAR STORE - VPN SERVER MENU${NC}"
-    echo "========================================"
-    echo " 1. Add XRAY User (VLESS/VMess/Trojan)"
-    echo " 2. Delete XRAY User"
-    echo " 3. List XRAY Users"
-    echo " 4. Show XRAY Share Links"
-    echo " 5. Check Service Status"
-    echo " 6. Renew SSL Certificate"
-    echo " 7. Reboot Server"
-    echo "----------------------------------------"
-}
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        await update.message.reply_text("Maaf, Anda tidak diizinkan menggunakan bot ini.")
+        return
+    await update.message.reply_markdown_v2(
+        f"Halo {user.mention_markdown_v2()}\!\n"
+        "Saya adalah bot manajemen VPS\. Berikut adalah perintah yang tersedia:\n"
+        "\`/tambah [username] [kuota_MB] [masa_aktif_hari]\`\n"
+        "\`/hapus [username]\`\n"
+        "\`/list\`\n"
+        "\`/sharelink [username]\`"
+    )
 
-while true; do
-    show_menu
-    read -rp "Pilih opsi [1-7]: " opt
-    case $opt in
-        1) add_user; press_enter ;;
-        2) del_user; press_enter ;;
-        3) list_users; press_enter ;;
-        4) show_share_links; press_enter ;;
-        5) check_service_status; press_enter ;;
-        6) renew_ssl; press_enter ;;
-        7) reboot_server ;;
-        *) echo "Opsi tidak valid." ;;
-    esac
-done
+async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        await update.message.reply_text("Maaf, Anda tidak diizinkan menggunakan bot ini.")
+        return
+    
+    args = context.args
+    if len(args) != 3:
+        await update.message.reply_text("Format salah. Gunakan: /tambah [username] [kuota_MB] [masa_aktif_hari]")
+        return
 
-setup_security() {
-    info "Setting up Firewall, Fail2Ban, and BBR..."
+    username, quota, days = args
+    await update.message.reply_text(f"Menambah pengguna {username}...")
+    
+    try:
+        result = subprocess.run(
+            ['/bin/bash', SCRIPT_PATH, 'add_user', username, quota, days],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        await update.message.reply_text(result.stdout)
+    except subprocess.CalledProcessError as e:
+        await update.message.reply_text(f"Error: {e.stderr}")
 
-    ufw default deny incoming >/dev/null 2>&1
-    ufw default allow outgoing >/dev/null 2>&1
+async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        await update.message.reply_text("Maaf, Anda tidak diizinkan menggunakan bot ini.")
+        return
+    
+    args = context.args
+    if len(args) != 1:
+        await update.message.reply_text("Format salah. Gunakan: /hapus [username]")
+        return
+    
+    username = args[0]
+    await update.message.reply_text(f"Menghapus pengguna {username}...")
+    
+    try:
+        result = subprocess.run(
+            ['/bin/bash', SCRIPT_PATH, 'remove_user', username],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        await update.message.reply_text(result.stdout)
+    except subprocess.CalledProcessError as e:
+        await update.message.reply_text(f"Error: {e.stderr}")
 
-    ufw allow 80/tcp      # XRAY Non-TLS
-    ufw allow 443/tcp     # XRAY TLS
+async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        await update.message.reply_text("Maaf, Anda tidak diizinkan menggunakan bot ini.")
+        return
 
-    yes | ufw enable
+    await update.message.reply_text("Mendapatkan daftar pengguna...")
+    
+    try:
+        result = subprocess.run(
+            ['/bin/bash', SCRIPT_PATH, 'list_users'],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        await update.message.reply_text(result.stdout)
+    except subprocess.CalledProcessError as e:
+        await update.message.reply_text(f"Error: {e.stderr}")
 
-    systemctl enable fail2ban >/dev/null 2>&1
-    systemctl restart fail2ban
+async def generate_sharelink(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        await update.message.reply_text("Maaf, Anda tidak diizinkan menggunakan bot ini.")
+        return
 
-    if ! grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf; then
-        echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
-    fi
-    if ! grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf; then
-        echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-    fi
+    args = context.args
+    if len(args) != 1:
+        await update.message.reply_text("Format salah. Gunakan: /sharelink [username]")
+        return
+    
+    username = args[0]
+    await update.message.reply_text(f"Membuat tautan untuk {username}...")
+    
+    try:
+        result = subprocess.run(
+            ['/bin/bash', SCRIPT_PATH, 'sharelink', username],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        await update.message.reply_text(result.stdout)
+    except subprocess.CalledProcessError as e:
+        await update.message.reply_text(f"Error: {e.stderr}")
 
-    sysctl -p >/dev/null 2>&1
+def main() -> None:
+    application = Application.builder().token(TOKEN).build()
 
-    if sysctl net.ipv4.tcp_congestion_control | grep -q "bbr"; then
-        info "TCP BBR enabled successfully."
-    else
-        warn "TCP BBR could not be enabled."
-    fi
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("tambah", add_user))
+    application.add_handler(CommandHandler("hapus", remove_user))
+    application.add_handler(CommandHandler("list", list_users))
+    application.add_handler(CommandHandler("sharelink", generate_sharelink))
 
-    info "Security and performance enhancements completed."
-}
+    application.run_polling()
 
-create_vpn_monitor() {
-    cat > /usr/local/bin/vpn-monitor << 'EOF'
-#!/bin/bash
-USER_DB="/etc/regarstore/users.db"
-XRAY_API_ADDR="127.0.0.1:10085"
-XRAY_BIN="/usr/local/bin/xray"
-LOG_FILE="/var/log/vpn-monitor.log"
-
-log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
-}
-
-remove_user() {
-    local email="$1"
-    local proto="$2"
-    local inbound="${proto}-in"
-
-    log "Removing user $email due to quota or expiration."
-
-    # Hapus user dari config XRAY via API
-    $XRAY_BIN api inbound remove --server=$XRAY_API_ADDR --tag="$inbound" --email="$email" >/dev/null 2>&1
-
-    # Hapus dari database lokal
-    sed -i "/^$email;/d" "$USER_DB"
-    log "User   $email removed."
-}
-
-check_users() {
-    if [ ! -f "$USER_DB" ]; then
-        log "User   database not found."
-        exit 1
-    fi
-
-    current_date_s=$(date +%s)
-
-    while IFS=';' read -r email proto id quota ip_limit exp_date; do
-        [[ "$email" =~ ^#.*$ ]] && continue
-        [[ -z "$email" ]] && continue
-
-        exp_date_s=$(date -d "$exp_date" +%s)
-        if (( current_date_s > exp_date_s )); then
-            remove_user "$email" "$proto"
-            continue
-        fi
-
-        if (( quota > 0 )); then
-            uplink=$($XRAY_BIN api stats --server=$XRAY_API_ADDR --query "user>>>$email>>>traffic>>>uplink" --reset 2>/dev/null || echo 0)
-            downlink=$($XRAY_BIN api stats --server=$XRAY_API_ADDR --query "user>>>$downlink" --reset 2>/dev/null || echo 0)
-
-            usage_file="/etc/regarstore/usage/${email}.usage"
-            mkdir -p /etc/regarstore/usage
-            prev_usage=$(cat "$usage_file" 2>/dev/null || echo 0)
-            total_usage=$((prev_usage + uplink + downlink))
-            echo "$total_usage" > "$usage_file"
-
-            quota_bytes=$((quota * 1024 * 1024 * 1024))
-            if (( total_usage > quota_bytes )); then
-                remove_user "$email" "$proto"
-                rm -f "$usage_file"
-            fi
-        fi
-    done < "$USER_DB"
-}
-
-log "VPN monitor started."
-check_users
-log "VPN monitor finished."
+if __name__ == "__main__":
+    main()
 EOF
 
-    chmod +x /usr/local/bin/vpn-monitor
-    info "VPN monitor script created at /usr/local/bin/vpn-monitor"
+    info "Bot Telegram telah dikonfigurasi. Untuk menjalankannya, gunakan perintah ini:"
+    echo ""
+    echo "  screen -S vpn_bot"
+    echo "  python3 $BOT_SCRIPT"
+    echo ""
+    echo "Tekan CTRL+A+D untuk keluar dari screen dan membiarkan bot berjalan di latar belakang."
 }
 
-finalize_installation() {
-    info "Finalizing installation..."
+function uninstall_all() {
+  echo "PERINGATAN: Tindakan ini akan menghapus semua paket yang diinstal oleh skrip ini!"
+  read -p "Apakah Anda yakin ingin melanjutkan? (y/N): " confirm
+  if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+    echo "Uninstalasi dibatalkan."
+    return
+  fi
 
-    cat > /usr/local/bin/motd_generator << 'EOF'
-#!/bin/bash
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
+  info "Menghentikan dan menonaktifkan layanan..."
+  systemctl stop xray nginx 2>/dev/null
+  systemctl disable xray nginx 2>/dev/null
+  
+  # Hentikan proses bot Telegram jika sedang berjalan
+  info "Menghentikan proses bot Telegram jika sedang berjalan..."
+  pkill -f "$BOT_SCRIPT" 2>/dev/null
+  
+  # Hapus file skrip bot dan library
+  if [ -f "$BOT_SCRIPT" ]; then
+    info "Menghapus file bot Telegram..."
+    rm -f "$BOT_SCRIPT"
+  fi
+  if pip3 show python-telegram-bot >/dev/null 2>&1; then
+    info "Menghapus library python-telegram-bot..."
+    pip3 uninstall -y python-telegram-bot
+  fi
 
-domain=$(cat /root/domain.txt)
-ip=$(curl -s ifconfig.me)
-date_now=$(date +"%Y-%m-%d %H:%M:%S")
 
-echo -e "${GREEN}==============================================${NC}"
-echo -e "   Selamat datang di Regar Store VPN Server"
-echo -e "   Domain: ${YELLOW}$domain${NC}"
-echo -e "   IP VPS: ${YELLOW}$ip${NC}"
-echo -e "   Waktu : ${YELLOW}$date_now${NC}"
-echo -e "${GREEN}==============================================${NC}"
-echo -e "Ketik 'menu' untuk membuka menu manajemen."
-EOF
+  info "Menghapus cronjob..."
+  crontab -l | grep -v "$CONFIG_DIR/maintenance.sh" | crontab -
 
-    chmod +x /usr/local/bin/motd_generator
-    echo "/usr/local/bin/motd_generator" > /etc/profile.d/99-regarstore-motd.sh
+  info "Menghapus paket..."
+  apt-get purge -y xray nginx certbot python3-certbot-nginx python3-pip
+  apt-get autoremove -y
 
-    # Setup cron jobs
-    (crontab -l 2>/dev/null; echo "0 5 * * * /usr/bin/certbot renew --quiet --pre-hook 'systemctl stop xray' --post-hook 'systemctl start xray'") | crontab -
-    (crontab -l 2>/dev/null; echo "*/5 * * * * /usr/local/bin/vpn-monitor >> /var/log/vpn-monitor.log 2>&1") | crontab -
+  info "Menghapus file konfigurasi dan direktori..."
+  rm -rf "$CONFIG_DIR"
+  rm -rf /etc/letsencrypt/live/$DOMAIN*
+  rm -rf /etc/letsencrypt/archive/$DOMAIN*
+  rm -f "$NGINX_SITES_AVAILABLE/$DOMAIN"
+  rm -f "$NGINX_SITES_ENABLED/$DOMAIN"
+  rm -f "$CONFIG_FILE"
+  rm -f "$USER_DB"
+  rm -f "$BOT_SCRIPT"
+  rm -f /usr/local/etc/xray/config.json
+  rm -f /etc/systemd/system/xray.service.d/10-donot_touch_single_conf.conf
 
-    info "Instalasi selesai! Silakan reboot server Anda."
+  echo "Semua paket dan file konfigurasi telah dihapus."
+  echo "Sistem Anda sekarang bersih dari instalasi skrip ini."
 }
 
-main() {
-    check_root
-    warn "Pastikan domain Anda sudah di-pointing ke IP Address VPS ini."
-    ask_domain
+function install_all() {
+    echo "=== Memulai Instalasi Xray dan Nginx ==="
+    read -p "Masukkan domain Anda (contoh: example.com): " DOMAIN
+    read -p "Masukkan email untuk sertifikat TLS (Let's Encrypt): " EMAIL
+
+    if [[ -z "$DOMAIN" || -z "$EMAIL" ]]; then
+        error "Domain dan Email tidak boleh kosong. Instalasi dibatalkan."
+    fi
+
+    mkdir -p "$CONFIG_DIR"
+    save_config
+    
     install_dependencies
-    setup_xray
-    setup_security
-    setup_management_menu
-    create_vpn_monitor
-    finalize_installation
-    info "Instalasi selesai! Silakan reboot server Anda."
-    # reboot
+    install_xray
+    check_dns
+    setup_certbot_standalone
+    setup_nginx
+    generate_xray_config
+    
+    set_xray_config_path
+    
+    restart_xray
+    
+    echo "Instalasi Xray dan Nginx selesai."
+    echo ""
+    read -p "Apakah Anda ingin mengatur bot Telegram? (y/N): " setup_bot_choice
+    if [[ "$setup_bot_choice" == "y" || "$setup_bot_choice" == "Y" ]]; then
+        setup_telegram_bot
+    fi
+    pause
 }
 
-main
+function menu() {
+  load_config
+  clear
+  echo "=== Menu Manajemen Xray VPS ==="
+  is_installed
+  is_running
+  echo "-----------------------------"
+  echo "1) Install Xray dan Nginx"
+  echo "2) Tambah User"
+  echo "3) List User"
+  echo "4) Hapus User"
+  echo "5) Setup Cronjob Hapus User Expired"
+  echo "6) Generate Share Link User (Format URL)"
+  echo "7) Uninstall Semua Paket"
+  echo "8) Keluar"
+  read -p "Pilih menu [1-8]: " choice
+
+  case $choice in
+    1) install_all ;;
+    2) read -p "Masukkan username: " username; read -p "Masukkan kuota (MB): " quota; read -p "Masukkan masa aktif (hari): " days; add_user_cmd "$username" "$quota" "$days"; pause ;;
+    3) list_users_cmd; pause ;;
+    4) read -p "Masukkan username yang ingin dihapus: " username; remove_user_cmd "$username"; pause ;;
+    5) setup_cronjob; pause ;;
+    6) read -p "Masukkan username: " username; generate_sharelink "$username"; pause ;;
+    7) uninstall_all; pause ;;
+    8) exit 0 ;;
+    *) echo "Pilihan tidak valid"; pause ;;
+  esac
+}
+
+# Periksa argumen baris perintah
+if [[ "$1" == "add_user" ]]; then
+    add_user_cmd "$2" "$3" "$4"
+elif [[ "$1" == "remove_user" ]]; then
+    remove_user_cmd "$2"
+elif [[ "$1" == "list_users" ]]; then
+    list_users_cmd
+elif [[ "$1" == "sharelink" ]]; then
+    generate_sharelink "$2"
+else
+    menu
+fi
