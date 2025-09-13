@@ -8,6 +8,7 @@ NGINX_SITES_AVAILABLE="/etc/nginx/sites-available"
 NGINX_SITES_ENABLED="/etc/nginx/sites-enabled"
 BOT_SCRIPT="$CONFIG_DIR/bot.py"
 MAIN_SCRIPT_PATH=$(readlink -f "$0")
+TELEGRAM_TOKEN="" # Ini akan diisi otomatis oleh bot
 
 function info() {
     echo "[*] $1"
@@ -32,6 +33,7 @@ function save_config() {
   cat > "$CONFIG_FILE" <<EOF
 DOMAIN="$DOMAIN"
 EMAIL="$EMAIL"
+CUSTOM_DNS="$CUSTOM_DNS"
 EOF
 }
 
@@ -236,11 +238,29 @@ function generate_xray_config() {
   vmess_clients=$(echo "$users_json" | jq '[.users[] | {id: .id, alterId: 0, email: .username}]')
   trojan_clients=$(echo "$users_json" | jq '[.users[] | {password: .id, email: .username}]')
 
+  local dns_block='
+  "dns": {
+    "servers": [
+      "'$CUSTOM_DNS'"
+    ]
+  },'
+  
+  # Default ke 8.8.8.8 jika tidak ada DNS kustom
+  if [[ -z "$CUSTOM_DNS" ]]; then
+    dns_block='
+  "dns": {
+    "servers": [
+      "8.8.8.8"
+    ]
+  },'
+  fi
+
   cat > "$XRAY_CONFIG" <<EOF
 {
   "log": {
     "loglevel": "warning"
   },
+  $dns_block
   "inbounds": [
     {
       "port": 8080,
@@ -457,6 +477,31 @@ function setup_cronjob() {
   info "Cronjob hapus user expired sudah dibuat (jalan tiap jam 00:00)."
 }
 
+function start_bot_menu() {
+  if screen -list | grep -q "vpn_bot"; then
+    echo "Bot Telegram sudah berjalan. Melakukan restart..."
+    pkill -f "$BOT_SCRIPT" 2>/dev/null
+    sleep 2 # Beri jeda agar proses benar-benar mati
+  else
+    echo "Memulai Bot Telegram di latar belakang..."
+  fi
+
+  screen -dmS vpn_bot python3 "$BOT_SCRIPT"
+  
+  echo "Bot Telegram telah dimulai di sesi 'screen' bernama vpn_bot."
+  echo "Anda bisa mengeceknya dengan 'screen -r vpn_bot'."
+}
+
+function stop_bot_menu() {
+  if screen -list | grep -q "vpn_bot"; then
+    echo "Menghentikan Bot Telegram..."
+    pkill -f "$BOT_SCRIPT"
+    echo "Bot Telegram berhasil dihentikan."
+  else
+    echo "Bot Telegram tidak sedang berjalan."
+  fi
+}
+
 function generate_sharelink() {
   local username=$1
   if [ -z "$username" ]; then
@@ -474,19 +519,20 @@ function generate_sharelink() {
   domain="$DOMAIN"
   expire=$(echo "$user" | jq -r '.expire')
   
+  # Output HTML untuk bot Telegram
   echo "====================================================="
-  echo "        Tautan Berbagi untuk Pengguna: $username     "
-  echo "           Masa Aktif hingga: $expire                "
+  echo "Tautan Berbagi untuk Pengguna: $username"
+  echo "Masa Aktif hingga: $expire"
   echo "====================================================="
   echo ""
   
   echo "######### VLESS (WS & gRPC) #########"
   echo "######### WebSocket (WS) #########"
   vless_ws_link="vless://${id}@${domain}:443?type=ws&security=tls&host=${domain}&path=%2Fvless-ws&sni=${domain}#${username}-WS"
-  echo "$vless_ws_link"
+  echo "<pre>$vless_ws_link</pre>"
   echo "######### gRPC #########"
   vless_grpc_link="vless://${id}@${domain}:443/?security=tls&encryption=none&headerType=gun&type=grpc&flow=none&serviceName=vless-grpc&sni=${domain}#${username}-gRPC"
-  echo "$vless_grpc_link"
+  echo "<pre>$vless_grpc_link</pre>"
   echo ""
   
   echo "######### VMess (WS & gRPC) #########"
@@ -505,7 +551,7 @@ function generate_sharelink() {
     tls: "tls"
   }')
   vmess_ws_link="vmess://$(echo -n "$vmess_ws_json" | base64 -w0)"
-  echo "$vmess_ws_link"
+  echo "<pre>$vmess_ws_link</pre>"
   echo "######### gRPC #########"
   vmess_grpc_json=$(jq -n --arg id "$id" --arg domain "$domain" --arg username "$username" '{
     v: "2",
@@ -522,18 +568,64 @@ function generate_sharelink() {
     sni: $domain
   }')
   vmess_grpc_link="vmess://$(echo -n "$vmess_grpc_json" | base64 -w0)"
-  echo "$vmess_grpc_link"
+  echo "<pre>$vmess_grpc_link</pre>"
   echo ""
   
   echo "######### Trojan (WS & gRPC) #########"
   echo "######### WebSocket (WS) #########"
   trojan_ws_link="trojan://${id}@${domain}:443?security=tls&type=ws&host=${domain}&path=%2Ftrojan-ws&sni=${domain}#${username}-WS"
-  echo "$trojan_ws_link"
+  echo "<pre>$trojan_ws_link</pre>"
   echo "######### gRPC #########"
   trojan_grpc_link="trojan://${id}@${domain}:443?security=tls&type=grpc&serviceName=trojan-grpc&serverName=${domain}&headerType=gun&flow=none&sni=${domain}#${username}-gRPC"
-  echo "$trojan_grpc_link"
+  echo "<pre>$trojan_grpc_link</pre>"
   echo ""
 }
+
+function backup_users() {
+  info "Membuat backup users.json..."
+  BACKUP_FILENAME="xray_users_$(date +%Y%m%d_%H%M%S).zip"
+  zip -j "$CONFIG_DIR/$BACKUP_FILENAME" "$USER_DB"
+  echo "$CONFIG_DIR/$BACKUP_FILENAME"
+}
+
+function restore_from_telegram() {
+  local filepath=$1
+  if [ -z "$filepath" ]; then
+    echo "Tidak ada file yang diberikan untuk restore."
+    return 1
+  fi
+
+  info "Memulihkan data pengguna dari $filepath..."
+  unzip -o -j "$filepath" users.json -d "$CONFIG_DIR" > /dev/null
+  if [ $? -eq 0 ]; then
+    info "File users.json berhasil dipulihkan."
+    rm -f "$filepath"
+    generate_xray_config
+    restart_xray
+    echo "Restore selesai. Xray telah direstart."
+  else
+    echo "Gagal mengekstrak users.json dari file zip. Pastikan format file benar."
+  fi
+}
+
+function change_dns() {
+  info "Mengubah Server DNS..."
+  read -p "Masukkan IP DNS baru (contoh: 8.8.8.8): " new_dns
+  
+  # Validasi sederhana untuk format IP
+  if [[ ! "$new_dns" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+    echo "IP DNS tidak valid. Menggunakan DNS default (8.8.8.8)."
+    CUSTOM_DNS="8.8.8.8"
+  else
+    CUSTOM_DNS="$new_dns"
+  fi
+  
+  save_config
+  generate_xray_config
+  restart_xray
+  info "DNS Xray berhasil diubah menjadi: $CUSTOM_DNS"
+}
+
 
 function setup_telegram_bot() {
     read -p "Masukkan Token Bot Telegram: " BOT_TOKEN
@@ -543,6 +635,9 @@ function setup_telegram_bot() {
         info "Token atau Chat ID kosong. Bot Telegram tidak akan diinstal."
         return
     fi
+    
+    # Simpan token ke file konfigurasi untuk penggunaan curl di skrip bash
+    echo "TELEGRAM_TOKEN=\"$BOT_TOKEN\"" >> "$CONFIG_FILE"
 
     info "Menginstal library Python untuk bot Telegram..."
     pip3 install python-telegram-bot --upgrade
@@ -551,7 +646,7 @@ function setup_telegram_bot() {
     cat > "$BOT_SCRIPT" <<EOF
 import logging
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 import subprocess
 import os
 
@@ -574,7 +669,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "\`/tambah [username] [kuota_MB] [masa_aktif_hari]\`\n"
         "\`/hapus [username]\`\n"
         "\`/list\`\n"
-        "\`/sharelink [username]\`"
+        "\`/sharelink [username]\`\n"
+        "\`/backup\` \(kirim data pengguna ke Telegram\)\n"
+        "\`/restore\` \(pulihkan data pengguna\)"
     )
 
 async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -663,9 +760,74 @@ async def generate_sharelink(update: Update, context: ContextTypes.DEFAULT_TYPE)
             text=True,
             check=True
         )
+        # Menggunakan reply_html untuk mendukung tag <pre>
+        await update.message.reply_html(result.stdout)
+    except subprocess.CalledProcessError as e:
+        await update.message.reply_text(f"Error: {e.stderr}")
+
+async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        await update.message.reply_text("Maaf, Anda tidak diizinkan menggunakan bot ini.")
+        return
+
+    await update.message.reply_text("Membuat backup data pengguna...")
+    
+    try:
+        result = subprocess.run(
+            ['/bin/bash', SCRIPT_PATH, 'backup'],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        file_path = result.stdout.strip()
+        
+        if os.path.exists(file_path):
+            await update.message.reply_document(
+                document=open(file_path, 'rb'),
+                caption="Backup data pengguna berhasil."
+            )
+            os.remove(file_path)
+        else:
+            await update.message.reply_text("Gagal membuat file backup.")
+    except subprocess.CalledProcessError as e:
+        await update.message.reply_text(f"Error: {e.stderr}")
+
+async def restore_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        await update.message.reply_text("Maaf, Anda tidak diizinkan menggunakan bot ini.")
+        return
+    
+    context.user_data['restore_state'] = True
+    await update.message.reply_text("Silakan unggah file backup (.zip) untuk restore.")
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.id != ADMIN_CHAT_ID or context.user_data.get('restore_state') is not True:
+        await update.message.reply_text("Perintah tidak valid atau tidak diizinkan.")
+        return
+    
+    file_id = update.message.document.file_id
+    file_info = await context.bot.get_file(file_id)
+    
+    temp_dir = "/tmp/xray_restore"
+    os.makedirs(temp_dir, exist_ok=True)
+    file_path = os.path.join(temp_dir, update.message.document.file_name)
+    
+    await file_info.download_to_drive(file_path)
+    await update.message.reply_text("File backup berhasil diunduh. Memulai proses restore...")
+    
+    try:
+        result = subprocess.run(
+            ['/bin/bash', SCRIPT_PATH, 'restore', file_path],
+            capture_output=True,
+            text=True,
+            check=True
+        )
         await update.message.reply_text(result.stdout)
     except subprocess.CalledProcessError as e:
         await update.message.reply_text(f"Error: {e.stderr}")
+    finally:
+        context.user_data['restore_state'] = False
+        os.remove(file_path)
 
 def main() -> None:
     application = Application.builder().token(TOKEN).build()
@@ -675,6 +837,9 @@ def main() -> None:
     application.add_handler(CommandHandler("hapus", remove_user))
     application.add_handler(CommandHandler("list", list_users))
     application.add_handler(CommandHandler("sharelink", generate_sharelink))
+    application.add_handler(CommandHandler("backup", backup_command))
+    application.add_handler(CommandHandler("restore", restore_command))
+    application.add_handler(MessageHandler(filters.Document.ZIP, handle_document))
 
     application.run_polling()
 
@@ -783,34 +948,51 @@ function menu() {
   echo "2) Tambah User"
   echo "3) List User"
   echo "4) Hapus User"
-  echo "5) Setup Cronjob Hapus User Expired"
-  echo "6) Generate Share Link User (Format URL)"
-  echo "7) Uninstall Semua Paket"
-  echo "8) Keluar"
-  read -p "Pilih menu [1-8]: " choice
+  echo "5) Backup Data User ke Telegram"
+  echo "6) Restore Data User dari Telegram"
+  echo "7) Ganti DNS Kustom"
+  echo "8) Setup Cronjob Hapus User Expired"
+  echo "9) Mulai/Restart Bot Telegram"
+  echo "10) Hentikan Bot Telegram"
+  echo "11) Generate Share Link User (Format URL)"
+  echo "12) Uninstall Semua Paket"
+  echo "13) Keluar"
+  read -p "Pilih menu [1-13]: " choice
 
   case $choice in
     1) install_all ;;
     2) read -p "Masukkan username: " username; read -p "Masukkan kuota (MB): " quota; read -p "Masukkan masa aktif (hari): " days; add_user_cmd "$username" "$quota" "$days"; pause ;;
     3) list_users_cmd; pause ;;
     4) read -p "Masukkan username yang ingin dihapus: " username; remove_user_cmd "$username"; pause ;;
-    5) setup_cronjob; pause ;;
-    6) read -p "Masukkan username: " username; generate_sharelink "$username"; pause ;;
-    7) uninstall_all; pause ;;
-    8) exit 0 ;;
+    5) backup_users; pause ;;
+    6) echo "Silakan gunakan bot Telegram untuk restore. Kirim /restore di bot, lalu unggah file zip backup." ; pause ;;
+    7) change_dns; pause ;;
+    8) setup_cronjob; pause ;;
+    9) start_bot_menu; pause ;;
+    10) stop_bot_menu; pause ;;
+    11) read -p "Masukkan username: " username; generate_sharelink "$username"; pause ;;
+    12) uninstall_all; pause ;;
+    13) exit 0 ;;
     *) echo "Pilihan tidak valid"; pause ;;
   esac
 }
 
 # Periksa argumen baris perintah
-if [[ "$1" == "add_user" ]]; then
+if [[ "$1" == "add_user" || "$1" == "remove_user" || "$1" == "list_users" || "$1" == "sharelink" || "$1" == "backup" || "$1" == "restore" ]]; then
+  load_config
+  if [[ "$1" == "add_user" ]]; then
     add_user_cmd "$2" "$3" "$4"
-elif [[ "$1" == "remove_user" ]]; then
+  elif [[ "$1" == "remove_user" ]]; then
     remove_user_cmd "$2"
-elif [[ "$1" == "list_users" ]]; then
+  elif [[ "$1" == "list_users" ]]; then
     list_users_cmd
-elif [[ "$1" == "sharelink" ]]; then
+  elif [[ "$1" == "sharelink" ]]; then
     generate_sharelink "$2"
+  elif [[ "$1" == "backup" ]]; then
+    backup_users
+  elif [[ "$1" == "restore" ]]; then
+    restore_from_telegram "$2"
+  fi
 else
     menu
 fi
